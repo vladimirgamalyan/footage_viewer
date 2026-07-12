@@ -1,0 +1,15 @@
+[package]
+name = "footage-viewer-media"
+version = "0.1.0"
+edition = "2021"
+
+# Decode core: open a clip and extract an evenly-spaced grid of thumbnails.
+# UI-agnostic (no egui) — returns raw RGBA so the app can build textures.
+
+[dependencies]
+ffmpeg-next = "8.1"
+anyhow = "1"
+
+[dev-dependencies]
+# For the dump_grid example, which eyeballs extract_grid output as PNGs.
+image = { version = "0.25", default-features = false, features = ["png"] }

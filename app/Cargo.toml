@@ -1,0 +1,9 @@
+[package]
+name = "footage_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+footage-viewer-media = { path = "../media" }
+eframe = "0.35"
+rfd = "0.15"

@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = ["app", "media"]
+# vendor holds the FFmpeg binary build; spike is standalone throwaway validation.
+exclude = ["vendor", "spike"]
