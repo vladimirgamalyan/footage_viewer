@@ -1,0 +1,12 @@
+[package]
+name = "ffmpeg_next_spike"
+version = "0.1.0"
+edition = "2021"
+
+# Spike: validate the ADR-0001 decode path (ffmpeg-next on Windows) by extracting
+# an evenly-spaced grid of thumbnails from a clip — the core operation of the app.
+
+[dependencies]
+ffmpeg-next = "8.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"

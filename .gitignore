@@ -1,0 +1,36 @@
+# --- Rust build output ---
+/target/
+**/target/
+# Rustfmt backups
+**/*.rs.bk
+
+# NOTE: Cargo.lock IS committed — this is an application/spike, not a library.
+
+# --- Native dependency (not source) ---
+# Local FFmpeg shared/dev build: a large binary blob fetched per machine, not source.
+# See docs/adr/0001-ffmpeg-integration-and-build-strategy.md.
+/vendor/
+
+# --- Machine-specific build env ---
+# Holds absolute FFMPEG_DIR / LIBCLANG_PATH for this machine. Copy
+# .cargo/config.toml.example to .cargo/config.toml and adjust paths.
+/.cargo/config.toml
+
+# --- Generated test media (recreate with test_videos/generate.sh) ---
+*.mp4
+*.mkv
+*.mov
+*.webm
+
+# --- Spike generated outputs (regenerable) ---
+/spike/ffmpeg_next/out/
+/spike/cli_contact_sheets/
+
+# --- Editor / IDE ---
+/.idea/
+/.vscode/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini

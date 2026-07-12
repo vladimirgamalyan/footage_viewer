@@ -1,0 +1,11 @@
+# Copy this to `.cargo/config.toml` (git-ignored) and adjust the paths for your machine.
+# These wire ffmpeg-sys-next's build:
+#   FFMPEG_DIR    — folder holding include/ and lib/ of an FFmpeg 8.1 shared/dev build
+#                   (an LGPL BtbN build; keep it in vendor/, which is git-ignored)
+#   LIBCLANG_PATH — your LLVM bin directory (used by bindgen; needs libclang that
+#                   matches ffmpeg-next's bindgen — see the ADR)
+# Not force-set, so an env var exported in the shell still wins.
+# Build and run from PowerShell, not Git Bash (see spike/README.md).
+[env]
+FFMPEG_DIR = 'C:\path\to\footage_viewer\vendor\ffmpeg-n8.1-latest-win64-lgpl-shared-8.1'
+LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
