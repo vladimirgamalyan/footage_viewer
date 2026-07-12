@@ -3,6 +3,9 @@
 //! Skeleton: synchronous extract-on-open + grid render. Background extraction and
 //! progressive fill (see docs/concept.md) come next.
 
+// In release, build as a Windows GUI app so launching from Explorer doesn't flash a console.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use eframe::egui;
