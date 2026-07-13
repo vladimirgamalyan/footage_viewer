@@ -1230,6 +1230,7 @@ dependencies = [
  "eframe",
  "footage-viewer-media",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

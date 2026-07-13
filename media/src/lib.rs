@@ -1,8 +1,11 @@
 //! Decode core for footage_viewer.
 //!
-//! One public operation for now: [`extract_grid`] opens a clip and returns an
-//! evenly-spaced grid of thumbnails, built in a single linear decode pass — see
-//! `spike/README.md` for why a linear pass beats seeking per cell.
+//! One public operation for now: [`extract_grid`] opens a clip and returns a
+//! contact sheet of thumbnails sampled at (or near) every keyframe, roughly one
+//! per `spacing_s` seconds. Only keyframe packets are sent to the decoder, so a
+//! single demux pass decodes ~1/GOP of the frames and never seeks — see
+//! `docs/adr/0003-keyframe-contact-sheet.md` for why this replaced the per-cell
+//! seek approach.
 
 use std::path::Path;
 
@@ -45,16 +48,63 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Extract `cells` thumbnails evenly spaced across the clip, streaming them out.
+/// Decides which keyframes to keep so kept thumbnails land about `spacing_s`
+/// apart. From the first keyframe interval it derives an integer skip factor
+/// `N = round(spacing_s / gop)` and keeps every N-th keyframe: on footage whose
+/// GOP is ~`spacing_s` this keeps them all (N = 1), and on denser footage it
+/// thins to roughly one per `spacing_s`. Assumes a near-constant GOP, which holds
+/// for camera files.
+struct KeyframeSampler {
+    spacing_s: f64,
+    first_t: Option<f64>,
+    step: usize,
+    index: usize,
+}
+
+impl KeyframeSampler {
+    fn new(spacing_s: f64) -> Self {
+        Self {
+            spacing_s,
+            first_t: None,
+            step: 0,
+            index: 0,
+        }
+    }
+
+    /// Whether the keyframe at time `t` (seconds) should become a thumbnail.
+    /// Keyframes must be passed in decode order.
+    fn keep(&mut self, t: f64) -> bool {
+        let i = self.index;
+        self.index += 1;
+        match self.first_t {
+            None => {
+                self.first_t = Some(t);
+                true
+            }
+            Some(t0) => {
+                if self.step == 0 {
+                    let gop = (t - t0).max(1e-6);
+                    self.step = ((self.spacing_s / gop).round() as usize).max(1);
+                }
+                i % self.step == 0
+            }
+        }
+    }
+}
+
+/// Extract a contact sheet of thumbnails sampled across the clip, streaming them out.
 ///
-/// Decodes the video stream once, top to bottom. `on_meta` is called once with
-/// clip metadata, then `on_thumb(index, thumbnail)` is called for each cell in
-/// order (index `0..cells`) as it becomes ready — so a caller can fill a grid
-/// progressively. Thumbnails fit into a box whose long side is `thumb_long_side`,
-/// preserving aspect.
+/// Only keyframe packets are sent to the decoder — each is intra-coded and decodes
+/// on its own, so the P/B frames in between are never decoded and the pass costs
+/// one frame per keyframe rather than a whole GOP. Keyframes are then thinned to
+/// about one per `spacing_s` (see [`KeyframeSampler`]). `on_meta` is called once
+/// with clip metadata, then `on_thumb(index, thumbnail)` is called for each kept
+/// frame in order (index `0, 1, 2, …`) as it becomes ready — the total count is
+/// not known up front. Thumbnails fit into a box whose long side is
+/// `thumb_long_side`, preserving aspect.
 pub fn extract_grid_streaming(
     path: &Path,
-    cells: usize,
+    spacing_s: f64,
     thumb_long_side: u32,
     mut on_meta: impl FnMut(GridMeta),
     mut on_thumb: impl FnMut(usize, Thumbnail),
@@ -68,8 +118,20 @@ pub fn extract_grid_streaming(
     let stream_index = stream.index();
     let tb = stream.time_base();
     let tb_secs = tb.numerator() as f64 / tb.denominator() as f64;
+    // Timeline origin: many camera files start at a non-zero PTS. Reported cell
+    // times are measured relative to it.
+    let start_s = match stream.start_time() {
+        ts if ts != ffmpeg::sys::AV_NOPTS_VALUE => ts as f64 * tb_secs,
+        _ => 0.0,
+    };
 
-    let decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+    let mut decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+    // Decode across all cores. Frame-level threading is the biggest speedup for
+    // H.264/HEVC (count 0 auto-detects the logical CPU count); the few frames of
+    // pipeline latency it adds are drained after each packet and at end-of-stream.
+    decoder_ctx.set_threading(ffmpeg::codec::threading::Config::kind(
+        ffmpeg::codec::threading::Type::Frame,
+    ));
     let mut decoder = decoder_ctx.decoder().video()?;
     let (src_w, src_h) = (decoder.width(), decoder.height());
     let (out_w, out_h) = thumb_size(src_w, src_h, thumb_long_side);
@@ -91,63 +153,91 @@ pub fn extract_grid_streaming(
         src_h,
     });
 
-    // Sample at the center of each of the N equal time slices.
-    let target_pts: Vec<i64> = (0..cells)
-        .map(|i| {
-            let t = duration_s * (i as f64 + 0.5) / cells as f64;
-            (t / tb_secs) as i64
-        })
-        .collect();
+    let mut next_index = 0usize;
+    let mut sampler = KeyframeSampler::new(spacing_s);
 
-    let mut next = 0usize;
-    let mut last: Option<Video> = None;
-
-    'outer: for (s, packet) in ictx.packets() {
+    for (s, packet) in ictx.packets() {
         if s.index() != stream_index {
             continue;
         }
-        decoder.send_packet(&packet).ok();
-        loop {
-            let mut frame = Video::empty();
-            if decoder.receive_frame(&mut frame).is_err() {
-                break;
-            }
-            let pts = frame.pts().unwrap_or(i64::MIN);
-            // One frame may satisfy several targets if slices are short.
-            while next < cells && pts >= target_pts[next] {
-                let thumb = scale_thumb(&mut scaler, &frame, out_w, out_h, pts as f64 * tb_secs)?;
-                on_thumb(next, thumb);
-                next += 1;
-            }
-            if next >= cells {
-                break 'outer;
-            }
-            last = Some(frame);
+        // Send only keyframe packets; everything between them is skipped entirely.
+        if !packet.is_key() {
+            continue;
         }
+        decoder.send_packet(&packet).ok();
+        drain(
+            &mut decoder,
+            &mut scaler,
+            tb_secs,
+            start_s,
+            out_w,
+            out_h,
+            &mut sampler,
+            &mut next_index,
+            &mut on_thumb,
+        )?;
     }
 
-    // Tail of the clip: any target past the last frame gets that last frame.
-    if next < cells {
-        if let Some(frame) = last.as_ref() {
-            let t = frame.pts().unwrap_or(0) as f64 * tb_secs;
-            while next < cells {
-                let thumb = scale_thumb(&mut scaler, frame, out_w, out_h, t)?;
-                on_thumb(next, thumb);
-                next += 1;
-            }
-        }
-    }
+    // Flush frames still buffered by the threaded decoder.
+    decoder.send_eof().ok();
+    drain(
+        &mut decoder,
+        &mut scaler,
+        tb_secs,
+        start_s,
+        out_w,
+        out_h,
+        &mut sampler,
+        &mut next_index,
+        &mut on_thumb,
+    )?;
 
     Ok(())
 }
 
+/// Drain every frame currently available from the decoder (all keyframes, since
+/// only keyframe packets are sent), emitting a thumbnail for each one the sampler
+/// decides to keep.
+#[allow(clippy::too_many_arguments)]
+fn drain(
+    decoder: &mut ffmpeg::decoder::Video,
+    scaler: &mut Scaler,
+    tb_secs: f64,
+    start_s: f64,
+    out_w: u32,
+    out_h: u32,
+    sampler: &mut KeyframeSampler,
+    next_index: &mut usize,
+    on_thumb: &mut impl FnMut(usize, Thumbnail),
+) -> anyhow::Result<()> {
+    loop {
+        let mut frame = Video::empty();
+        if decoder.receive_frame(&mut frame).is_err() {
+            break;
+        }
+        let time_s = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
+        if sampler.keep(time_s) {
+            let thumb = scale_thumb(scaler, &frame, out_w, out_h, time_s)?;
+            on_thumb(*next_index, thumb);
+            *next_index += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Frame PTS in stream time_base, falling back to the best-effort timestamp. A
+/// frame with neither is treated as very early so ordering stays monotonic.
+fn frame_pts(frame: &Video) -> i64 {
+    frame.pts().or_else(|| frame.timestamp()).unwrap_or(i64::MIN)
+}
+
 /// Extract the whole grid at once (convenience wrapper over [`extract_grid_streaming`]).
-pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::Result<Grid> {
+pub fn extract_grid(path: &Path, spacing_s: f64, thumb_long_side: u32) -> anyhow::Result<Grid> {
     let mut meta: Option<GridMeta> = None;
-    let mut thumbs = Vec::with_capacity(cells);
+    let mut thumbs = Vec::new();
     extract_grid_streaming(
         path,
-        cells,
+        spacing_s,
         thumb_long_side,
         |m| meta = Some(m),
         |_, t| thumbs.push(t),

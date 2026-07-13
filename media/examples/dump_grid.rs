@@ -11,7 +11,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&out_dir)?;
 
     footage_viewer_media::init()?;
-    let grid = footage_viewer_media::extract_grid(&path, 16, 320)?;
+    let grid = footage_viewer_media::extract_grid(&path, 1.0, 320)?;
     println!(
         "duration {:.2}s  src {}x{}  thumbs {}",
         grid.duration_s,
