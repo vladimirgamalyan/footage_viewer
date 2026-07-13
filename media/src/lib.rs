@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
+use image::ImageEncoder;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
@@ -538,6 +539,81 @@ pub fn play_stream(
     }
 }
 
+/// Decode the frame at `time_s` at full source resolution and write it to `out`
+/// as a JPEG at `quality` (1–100, higher is better). Seeks to the keyframe at or
+/// before the target and decodes forward to the first frame at/after it — the
+/// same precise landing a scrub uses — so the saved still matches what playback
+/// shows at that time. Overwrites `out` if it already exists.
+pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> anyhow::Result<()> {
+    let mut ictx = input(path)?;
+
+    let stream = ictx
+        .streams()
+        .best(Type::Video)
+        .ok_or_else(|| anyhow::anyhow!("no video stream"))?;
+    let stream_index = stream.index();
+    let tb = stream.time_base();
+    let tb_secs = tb.numerator() as f64 / tb.denominator() as f64;
+    let start_s = match stream.start_time() {
+        ts if ts != ffmpeg::sys::AV_NOPTS_VALUE => ts as f64 * tb_secs,
+        _ => 0.0,
+    };
+
+    let mut decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+    decoder_ctx.set_threading(ffmpeg::codec::threading::Config::kind(
+        ffmpeg::codec::threading::Type::Frame,
+    ));
+    let mut decoder = decoder_ctx.decoder().video()?;
+    let (w, h) = (decoder.width(), decoder.height());
+
+    // Full source resolution, RGB (no alpha) — JPEG has no alpha channel.
+    let mut scaler = Scaler::get(decoder.format(), w, h, Pixel::RGB24, w, h, Flags::BILINEAR)?;
+
+    // Land on the keyframe at or before the target, then decode forward to it.
+    let target_us = (((time_s + start_s) * AV_TIME_BASE) as i64 - SEEK_BACK_US).max(0);
+    ictx.seek(target_us, ..target_us)?;
+    decoder.flush();
+
+    let mut demux_eof = false;
+    let mut eof_sent = false;
+    // Keep the newest decoded frame so end-of-stream (target past the last frame)
+    // falls back to the final frame instead of failing.
+    let mut chosen: Option<Video> = None;
+    loop {
+        match next_frame(&mut ictx, &mut decoder, stream_index, &mut demux_eof, &mut eof_sent)? {
+            Some(frame) => {
+                let t = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
+                let reached = t + FRAME_EPS_S >= time_s;
+                chosen = Some(frame);
+                if reached {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    let frame = chosen.ok_or_else(|| anyhow::anyhow!("no frame decoded at {time_s:.3}s"))?;
+
+    let mut rgb = Video::empty();
+    scaler.run(&frame, &mut rgb)?;
+
+    // RGB24 rows are padded to stride(0); copy the visible width per row.
+    let stride = rgb.stride(0);
+    let data = rgb.data(0);
+    let row = w as usize * 3;
+    let mut buf = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        let start = y * stride;
+        buf.extend_from_slice(&data[start..start + row]);
+    }
+
+    let file = std::fs::File::create(out)?;
+    let writer = std::io::BufWriter::new(file);
+    image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality)
+        .write_image(&buf, w, h, image::ExtendedColorType::Rgb8)?;
+    Ok(())
+}
+
 /// Decode the next frame, pulling packets on demand. Returns `Ok(None)` only when
 /// the stream is fully drained. `demux_eof`/`eof_sent` track end-of-stream across
 /// calls and must be reset after a seek/flush.
@@ -664,6 +740,27 @@ mod tests {
         worker.join().unwrap().unwrap();
 
         assert!(landed.is_some(), "scrub did not land near 12s: {landed:?}");
+    }
+
+    /// `save_frame_jpeg` writes a valid JPEG at full source resolution for the
+    /// frame at the requested time.
+    #[test]
+    fn save_frame_jpeg_writes_full_res_still() {
+        init().unwrap();
+        let path = test_video("counter_25s_vertical.mp4");
+
+        // Source dimensions come from the grid metadata for the same clip.
+        let grid = extract_grid(&path, 5.0, 320).unwrap();
+        assert!(grid.src_w > 0 && grid.src_h > 0);
+
+        let out = std::env::temp_dir().join("footage_viewer_still_test.jpg");
+        save_frame_jpeg(&path, 12.0, &out, 92).unwrap();
+
+        let img = image::open(&out).expect("saved file is a readable image");
+        assert_eq!(img.width(), grid.src_w);
+        assert_eq!(img.height(), grid.src_h);
+
+        std::fs::remove_file(&out).ok();
     }
 
     /// `Stop` (and a dropped command channel) ends `play_stream` cleanly.

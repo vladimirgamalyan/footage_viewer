@@ -1,9 +1,3 @@
 Cache at the root of the disk you are viewing; disabled for permanent disks, only for mounted/removable disks.
 
-
-AWSD control the selection frame in grid mode; in player mode they step by half a second.
-In the storyboard, pressing Enter acts like clicking the selected frame.
-
-Selection frame in the storyboard: pressing I takes a screenshot of the selected frame and saves it next to the file under the same name with a .jpg extension (overwrites if it already exists) at good quality.
-
 In both storyboard and player modes, DEL sends the file to the recycle bin (without confirmation) and moves to the next file.

@@ -40,6 +40,10 @@ const SEEK_REPEAT_DELAY_S: f64 = 0.35;
 /// Interval between repeated A/D seeks while the key is held, in seconds.
 const SEEK_REPEAT_INTERVAL_S: f64 = 0.12;
 
+/// JPEG quality for stills saved with the "I" key (1–100). 92 keeps 4:4:4 chroma
+/// subsampling and near-lossless detail at a reasonable file size.
+const STILL_JPEG_QUALITY: u8 = 92;
+
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 
@@ -377,6 +381,17 @@ impl App {
         }
     }
 
+    /// Save a full-resolution JPEG of the frame at `time_s` next to the loaded
+    /// clip as `<clip-stem>.jpg`, overwriting any existing file. A no-op with
+    /// nothing loaded; records the reason in `self.error` on failure.
+    fn save_still(&mut self, time_s: f64) {
+        let Some(l) = &self.loaded else { return };
+        let out = l.path.with_extension("jpg");
+        if let Err(e) = media::save_frame_jpeg(&l.path, time_s, &out, STILL_JPEG_QUALITY) {
+            self.error = Some(format!("Failed to save still: {e:#}"));
+        }
+    }
+
     /// Leave playback for the grid, remembering the current position so Tab can
     /// resume there. A no-op when nothing is playing.
     fn stop_playback(&mut self) {
@@ -433,6 +448,13 @@ impl App {
         if !self.advance_player(ctx) {
             self.stop_playback();
             return;
+        }
+
+        // "I" saves the currently shown frame as a still next to the clip.
+        if ctx.input(|i| i.key_pressed(egui::Key::I)) {
+            if let Some(t) = self.player.as_ref().map(|p| p.position_s) {
+                self.save_still(t);
+            }
         }
 
         // No self-driven repaint loop: the decoder paces itself and requests a
@@ -719,19 +741,22 @@ impl eframe::App for App {
         // A frame clicked (or picked with Enter) this pass: its clip time, to
         // start playback there.
         let mut play_from: Option<f64> = None;
+        // Set when "I" is pressed on a ready cell: its clip time, to save a still.
+        let mut save_still_at: Option<f64> = None;
         // Set when AWSD moved the cursor this pass, so we only auto-scroll then
         // and don't fight the user's mouse-wheel scrolling.
         let mut cursor_moved = false;
 
-        // AWSD moves the frame cursor; Enter plays the frame under it.
+        // AWSD moves the frame cursor; Enter plays the frame under it; "I" saves it.
         if let Some(l) = &mut self.loaded {
-            let (left, right, up, down, enter) = ctx.input(|i| {
+            let (left, right, up, down, enter, save) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::A),
                     i.key_pressed(egui::Key::D),
                     i.key_pressed(egui::Key::W),
                     i.key_pressed(egui::Key::S),
                     i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::I),
                 )
             });
             let n = l.cells.len();
@@ -742,9 +767,12 @@ impl eframe::App for App {
                     l.cursor = move_cursor(l.cursor, n, GRID_COLS, dx, dy);
                     cursor_moved = true;
                 }
-                if enter {
-                    if let Some(Cell::Ready { time_s, .. }) = l.cells.get(l.cursor) {
+                if let Some(Cell::Ready { time_s, .. }) = l.cells.get(l.cursor) {
+                    if enter {
                         play_from = Some(*time_s);
+                    }
+                    if save {
+                        save_still_at = Some(*time_s);
                     }
                 }
             }
@@ -814,9 +842,12 @@ impl eframe::App for App {
             });
         });
 
-        // Start playback after the panel closure releases its borrow of `self`.
+        // Start playback / save a still after the panel closure releases `self`.
         if let Some(t) = play_from {
             self.play(&ctx, t);
+        }
+        if let Some(t) = save_still_at {
+            self.save_still(t);
         }
     }
 }
