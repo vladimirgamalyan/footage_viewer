@@ -1,6 +1,9 @@
 # --- Rust build output ---
 /target/
 **/target/
+
+# --- Packaged release artifacts (regenerable from a release build) ---
+/dist/
 # Rustfmt backups
 **/*.rs.bk
 
