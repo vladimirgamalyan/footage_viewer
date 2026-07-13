@@ -26,6 +26,17 @@ const AV_TIME_BASE: f64 = 1_000_000.0;
 /// rounding, so it steps back exactly one keyframe.
 const SEEK_BACK_US: i64 = 1_000;
 
+/// Cap on frame-decoding threads for playback. Frame threading delays the first
+/// output by roughly the thread count: the pipeline must fill before frame 0 is
+/// released, so the all-cores default (e.g. 32) buffers ~18 frames before the
+/// first is shown — a black gap at play start that grows with per-frame decode
+/// cost on heavy footage. Frame-threading throughput saturates well before that
+/// many threads for H.264/HEVC, so capping low keeps real-time playback while
+/// cutting the warmup (measured ~18 buffered frames at 32 threads down to ~8 at
+/// 6). The grid path intentionally keeps all cores: it is a batch decode where
+/// startup latency does not matter.
+const PLAYBACK_THREADS: usize = 6;
+
 /// One grid cell: a downscaled RGBA frame and the time it was sampled at.
 pub struct Thumbnail {
     pub time_s: f64,
@@ -299,9 +310,14 @@ pub fn play_stream(
     };
 
     let mut decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-    decoder_ctx.set_threading(ffmpeg::codec::threading::Config::kind(
-        ffmpeg::codec::threading::Type::Frame,
-    ));
+    // Cap frame threads to keep the play-start warmup short — see PLAYBACK_THREADS.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(PLAYBACK_THREADS))
+        .unwrap_or(1);
+    decoder_ctx.set_threading(ffmpeg::codec::threading::Config {
+        kind: ffmpeg::codec::threading::Type::Frame,
+        count: threads,
+    });
     let mut decoder = decoder_ctx.decoder().video()?;
     let (src_w, src_h) = (decoder.width(), decoder.height());
     let (out_w, out_h) = thumb_size(src_w, src_h, long_side);
