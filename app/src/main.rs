@@ -21,6 +21,16 @@ const GRID_COLS: usize = 4;
 /// upload cost; large enough for the video to fill a typical window crisply.
 const PLAYBACK_LONG: u32 = 1600;
 
+/// Minimum wall-clock gap between live seeks while dragging the scrubber. Each
+/// seek restarts the decoder, so throttling caps how many we fire during a drag
+/// while still tracking the cursor closely (~12/s).
+const SCRUB_INTERVAL_S: f64 = 0.08;
+
+/// Smallest cursor move (in media seconds) that triggers a new live seek while
+/// dragging. Holding within this of the current position keeps the frozen frame
+/// instead of restarting the decoder on the same spot.
+const SCRUB_MIN_STEP_S: f64 = 0.05;
+
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 
@@ -101,26 +111,22 @@ enum PlayMsg {
     Err(String),
 }
 
-/// Active playback of the loaded clip, filling the window. Frames arrive over a
-/// bounded channel (backpressure paces the decoder to real time); the UI shows
-/// each one when its presentation time is due against the egui wall clock.
+/// Active playback of the loaded clip, filling the window. One live decoder
+/// thread paces frames to real time and reacts to [`media::PlayCommand`]s; the UI
+/// sends commands (seek/pause) and displays whatever frame last arrived.
 struct Player {
+    /// Commands to the live decoder: seek, pause, resume, stop.
+    cmds: mpsc::Sender<media::PlayCommand>,
     rx: Receiver<PlayMsg>,
     tex: Option<egui::TextureHandle>,
     frame_size: egui::Vec2,
-    /// egui time when the playback clock was last anchored.
-    anchor_time: f64,
-    /// Media time of the frame shown at `anchor_time`.
-    anchor_media_s: f64,
-    /// False until the first frame arrives and anchors the clock.
-    started: bool,
-    /// A frame pulled from the channel but not yet due for display.
-    pending: Option<media::PlaybackFrame>,
+    /// Media time of the last shown frame, for the scrubber handle.
+    position_s: f64,
+    /// UI-side pause tracking, toggled by Space.
     paused: bool,
-    /// egui time when paused, to shift the anchor forward on resume.
-    pause_time: f64,
-    /// The decoder reached end-of-stream; drain what's left, then return to grid.
-    ended: bool,
+    /// While the scrubber is being dragged, the target time under the cursor,
+    /// used to position the handle.
+    scrub: Option<f64>,
 }
 
 /// A clip being (or already) loaded.
@@ -140,6 +146,12 @@ struct App {
     loaded: Option<Loaded>,
     /// Some while a clip is playing back over the grid.
     player: Option<Player>,
+    /// Media time to resume playback from when toggling back into the player
+    /// with Tab. Set when leaving playback for the grid; reset when a clip opens.
+    resume_from_s: f64,
+    /// egui time of the last live seek fired while dragging the scrubber, for
+    /// throttling (see [`SCRUB_INTERVAL_S`]).
+    scrub_last_seek: f64,
     error: Option<String>,
 }
 
@@ -160,8 +172,10 @@ impl App {
     /// Kick off background extraction; returns immediately.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.error = None;
-        // Leaving any current clip: stop playback and fall back to the grid.
+        // Leaving any current clip: stop playback, fall back to the grid, and
+        // reset the Tab-resume position to the start of the new clip.
         self.player = None;
+        self.resume_from_s = 0.0;
 
         let (tx, rx) = mpsc::channel();
         let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
@@ -247,152 +261,275 @@ impl App {
     }
 
     /// Start playing the loaded clip from the keyframe before `start_from_s`.
-    /// Spawns a decode thread that streams frames back over a bounded channel;
-    /// the full-resolution decode lives in `media`, timing lives here.
+    /// Spawns the live decoder thread (kept open for the whole clip) and wires up
+    /// the frame and command channels; seeking afterwards is a `PlayCommand`, not
+    /// a new thread. The full-resolution decode and pacing live in `media`.
     fn play(&mut self, ctx: &egui::Context, start_from_s: f64) {
         let Some(l) = &self.loaded else { return };
         let path = l.path.clone();
 
-        // Small bound: the decoder blocks on a full channel, which paces it to
-        // real time and lets pause "just work" (the UI stops draining).
-        let (tx, rx) = mpsc::sync_channel::<PlayMsg>(3);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<PlayMsg>(3);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<media::PlayCommand>();
         let ctx_frame = ctx.clone();
         thread::spawn(move || {
-            let result = media::play_stream(&path, start_from_s, PLAYBACK_LONG, |f| {
-                let delivered = tx.send(PlayMsg::Frame(f)).is_ok();
+            let result = media::play_stream(&path, start_from_s, PLAYBACK_LONG, cmd_rx, |f| {
+                let delivered = frame_tx.send(PlayMsg::Frame(f)).is_ok();
                 ctx_frame.request_repaint();
                 delivered
             });
             if let Err(e) = result {
-                let _ = tx.send(PlayMsg::Err(format!("{e:#}")));
-                ctx_frame.request_repaint();
+                let _ = frame_tx.send(PlayMsg::Err(format!("{e:#}")));
             }
+            // Wake the UI so it notices the closed channel (end-of-stream/error).
+            ctx_frame.request_repaint();
         });
 
         self.player = Some(Player {
-            rx,
+            cmds: cmd_tx,
+            rx: frame_rx,
             tex: None,
             frame_size: egui::Vec2::ZERO,
-            anchor_time: 0.0,
-            anchor_media_s: 0.0,
-            started: false,
-            pending: None,
+            position_s: start_from_s,
             paused: false,
-            pause_time: 0.0,
-            ended: false,
+            scrub: None,
         });
     }
 
-    /// Present frames that have come due against the wall clock. Returns `false`
-    /// when playback is over (end-of-stream drained, or a decode error), so the
+    /// Send a command to the live decoder, if a clip is playing.
+    fn send_cmd(&self, cmd: media::PlayCommand) {
+        if let Some(p) = &self.player {
+            let _ = p.cmds.send(cmd);
+        }
+    }
+
+    /// Take the latest frame the decoder produced and upload it (it already paces
+    /// itself, so whatever arrived is due). Returns `false` when playback is over
+    /// — the decoder closed its channel (end-of-stream) or hit an error — so the
     /// caller drops the player and returns to the grid.
     fn advance_player(&mut self, ctx: &egui::Context) -> bool {
-        let now = ctx.input(|i| i.time);
         let Some(p) = &mut self.player else { return true };
-        if p.paused {
-            return true;
-        }
+        let mut latest = None;
+        let mut ended = false;
         loop {
-            if p.pending.is_none() {
-                match p.rx.try_recv() {
-                    Ok(PlayMsg::Frame(f)) => p.pending = Some(f),
-                    Ok(PlayMsg::Err(e)) => {
-                        self.error = Some(e);
-                        return false;
-                    }
-                    Err(TryRecvError::Empty) => break, // decode not keeping up; wait
-                    Err(TryRecvError::Disconnected) => {
-                        p.ended = true;
-                        break;
-                    }
+            match p.rx.try_recv() {
+                Ok(PlayMsg::Frame(f)) => latest = Some(f),
+                Ok(PlayMsg::Err(e)) => {
+                    self.error = Some(e);
+                    return false;
                 }
-            }
-            let f = p.pending.as_ref().unwrap();
-            if !p.started {
-                p.started = true;
-                p.anchor_time = now;
-                p.anchor_media_s = f.time_s;
-            }
-            let target = p.anchor_media_s + (now - p.anchor_time);
-            if f.time_s <= target {
-                let f = p.pending.take().unwrap();
-                p.frame_size = egui::vec2(f.width as f32, f.height as f32);
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [f.width as usize, f.height as usize],
-                    &f.rgba,
-                );
-                match &mut p.tex {
-                    Some(tex) => tex.set(img, egui::TextureOptions::default()),
-                    None => p.tex = Some(ctx.load_texture("playback", img, egui::TextureOptions::default())),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    ended = true;
+                    break;
                 }
-            } else {
-                break; // not due yet
             }
         }
-        // End once the last decoded frame has been shown.
-        !(p.ended && p.pending.is_none())
+        if let Some(f) = latest {
+            p.frame_size = egui::vec2(f.width as f32, f.height as f32);
+            p.position_s = f.time_s;
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [f.width as usize, f.height as usize],
+                &f.rgba,
+            );
+            match &mut p.tex {
+                Some(tex) => tex.set(img, egui::TextureOptions::default()),
+                None => {
+                    p.tex =
+                        Some(ctx.load_texture("playback", img, egui::TextureOptions::default()))
+                }
+            }
+        }
+        !ended
     }
 
-    /// Space toggles pause; on resume the clock anchor slides forward by the
-    /// paused span so timing stays continuous.
-    fn toggle_pause(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|i| i.time);
+    /// Space toggles pause; the decoder holds or resumes its own clock.
+    fn toggle_pause(&mut self) {
         if let Some(p) = &mut self.player {
-            if p.paused {
-                p.anchor_time += now - p.pause_time;
-                p.paused = false;
+            p.paused = !p.paused;
+            let cmd = if p.paused {
+                media::PlayCommand::Pause
             } else {
-                p.paused = true;
-                p.pause_time = now;
-            }
+                media::PlayCommand::Resume
+            };
+            let _ = p.cmds.send(cmd);
         }
     }
 
-    /// Draw the playing clip filling the window and handle its keys. Returns to
-    /// the grid on a click, on Escape, on end-of-stream, or on a decode error.
-    /// Space pauses.
+    /// Leave playback for the grid, remembering the current position so Tab can
+    /// resume there. A no-op when nothing is playing.
+    fn stop_playback(&mut self) {
+        if let Some(p) = &self.player {
+            self.resume_from_s = p.position_s;
+        }
+        self.player = None;
+    }
+
+    /// Draw the playing clip filling the window and handle its keys. A click in
+    /// the video area, Tab, or a decode error returns to the grid; Escape closes
+    /// the app. A scrubber along the bottom shows the position and seeks on drag or
+    /// click. Left/Right play the previous/next sibling clip from its start,
+    /// staying in playback; Space pauses.
     fn playback_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Escape leaves playback and returns to the grid without quitting.
+        // Left/Right switch to the previous/next sibling clip and keep playing:
+        // open() loads the new clip (and kicks off its background grid), then we
+        // start playback from the start instead of dropping back to the grid.
+        let (prev, next) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
+        let neighbor = if prev {
+            self.neighbor(-1)
+        } else if next {
+            self.neighbor(1)
+        } else {
+            None
+        };
+        if let Some(path) = neighbor {
+            self.open(ctx, path);
+            self.play(ctx, 0.0);
+            return;
+        }
+
+        // Tab returns to the grid, remembering the position so Tab there resumes
+        // here. Consume it so egui doesn't also use it for focus navigation.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+            self.stop_playback();
+            return;
+        }
+
+        // Escape closes the app, matching the grid view.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.player = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.toggle_pause(ctx);
+            self.toggle_pause();
         }
         if !self.advance_player(ctx) {
-            self.player = None;
+            self.stop_playback();
             return;
         }
 
-        // Keep the clock ticking while playing; a paused frame is static.
-        let paused = self.player.as_ref().is_some_and(|p| p.paused);
-        if !paused {
-            ctx.request_repaint();
-        }
+        // No self-driven repaint loop: the decoder paces itself and requests a
+        // repaint per frame, and mouse motion drives repaints while dragging.
+        let now = ctx.input(|i| i.time);
+        let duration_s = self.loaded.as_ref().map(|l| l.duration_s).unwrap_or(0.0);
 
-        // Full-window black backdrop with the frame letterboxed into it. A click
-        // anywhere returns to the grid.
-        let clicked = egui::CentralPanel::default()
+        // Full-window black backdrop: the frame is letterboxed above a scrubber
+        // strip. A click in the video area returns to the grid; the scrubber
+        // handles its own clicks and drags.
+        let (clicked, seek) = egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ui, |ui| {
-                let rect = ui.max_rect();
-                let resp = ui.interact(rect, ui.id().with("playback"), egui::Sense::click());
+                let full = ui.max_rect();
+                let bar_h = 34.0;
+                let split = (full.max.y - bar_h).max(full.min.y);
+                let video_rect =
+                    egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, split));
+                let bar_rect =
+                    egui::Rect::from_min_max(egui::pos2(full.min.x, split), full.max);
+
+                let resp = ui.interact(video_rect, ui.id().with("playback"), egui::Sense::click());
                 if let Some(p) = &self.player {
                     if let Some(tex) = &p.tex {
-                        let target = fit_centered(rect, p.frame_size);
+                        let target = fit_centered(video_rect, p.frame_size);
                         let uv =
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                         ui.painter().image(tex.id(), target, uv, egui::Color32::WHITE);
                     }
                 }
-                resp.clicked()
+
+                let mut cmd = None;
+                if let Some(p) = &mut self.player {
+                    cmd = seek_bar_ui(
+                        ui,
+                        bar_rect,
+                        p,
+                        &mut self.scrub_last_seek,
+                        duration_s,
+                        now,
+                    );
+                }
+                (resp.clicked(), cmd)
             })
             .inner;
+
+        // Seeks go to the live decoder as commands — the player stays put.
+        if let Some(cmd) = seek {
+            self.send_cmd(cmd);
+        }
         if clicked {
-            self.player = None;
+            self.stop_playback();
         }
     }
+}
+
+/// Draw the playback scrubber into `rect` and handle interaction, VLC-style: a
+/// click jumps playback there, and dragging anywhere on the bar seeks live (the
+/// decoder shows the exact frame at the cursor and holds); releasing resumes
+/// playback from that spot. The handle just reflects the position. Returns the
+/// `PlayCommand` to send this frame — a held `Scrub` while dragging (throttled),
+/// or a `Play` on click/release — else `None`.
+fn seek_bar_ui(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    player: &mut Player,
+    last_seek: &mut f64,
+    duration_s: f64,
+    now: f64,
+) -> Option<media::PlayCommand> {
+    let resp = ui.interact(rect, ui.id().with("seek"), egui::Sense::click_and_drag());
+
+    let margin = 12.0;
+    let left = rect.left() + margin;
+    let right = rect.right() - margin;
+    let track_w = (right - left).max(1.0);
+    let y = rect.center().y;
+    let time_at_x = |x: f32| ((x - left) / track_w).clamp(0.0, 1.0) as f64 * duration_s;
+
+    let mut cmd = None;
+    if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let target = time_at_x(pos.x);
+            // Handle follows the cursor exactly. Fire a held live seek only once
+            // the cursor has moved off the shown frame, throttled so a fast drag
+            // doesn't flood the decoder with seeks.
+            player.scrub = Some(target);
+            let moved = (target - player.position_s).abs() >= SCRUB_MIN_STEP_S;
+            if moved && now - *last_seek >= SCRUB_INTERVAL_S {
+                *last_seek = now;
+                cmd = Some(media::PlayCommand::Scrub(target));
+            }
+        }
+    } else if let Some(target) = player.scrub.take() {
+        // Drag released: seek to the exact spot and resume normal playback.
+        cmd = Some(media::PlayCommand::Play(target));
+    }
+    if resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            cmd = Some(media::PlayCommand::Play(time_at_x(pos.x)));
+        }
+    }
+
+    let pos_s = player.scrub.unwrap_or(player.position_s);
+    let frac = if duration_s > 0.0 {
+        (pos_s / duration_s).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    let handle_x = left + frac * track_w;
+
+    let painter = ui.painter();
+    let track = egui::Rect::from_min_max(egui::pos2(left, y - 2.0), egui::pos2(right, y + 2.0));
+    let filled =
+        egui::Rect::from_min_max(egui::pos2(left, y - 2.0), egui::pos2(handle_x, y + 2.0));
+    painter.rect_filled(track, 2.0, egui::Color32::from_gray(70));
+    painter.rect_filled(filled, 2.0, egui::Color32::from_gray(200));
+    painter.circle_filled(egui::pos2(handle_x, y), 7.0, egui::Color32::WHITE);
+
+    cmd
 }
 
 /// Largest rect with `size`'s aspect ratio that fits centered inside `container`.
@@ -425,6 +562,15 @@ impl eframe::App for App {
         // hidden until playback ends or Escape returns here.
         if self.player.is_some() {
             self.playback_ui(ui, &ctx);
+            return;
+        }
+
+        // Tab (with a clip loaded) switches to the player, resuming where
+        // playback last left off. Consume it so egui doesn't move widget focus.
+        if self.loaded.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            self.play(&ctx, self.resume_from_s);
             return;
         }
 

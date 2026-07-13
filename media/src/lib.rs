@@ -8,6 +8,8 @@
 //! seek approach.
 
 use std::path::Path;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::format::{input, Pixel};
@@ -25,6 +27,10 @@ const AV_TIME_BASE: f64 = 1_000_000.0;
 /// of that same one. 1 ms is far below any real GOP length yet well above PTS
 /// rounding, so it steps back exactly one keyframe.
 const SEEK_BACK_US: i64 = 1_000;
+
+/// Tolerance when landing a precise seek: a decoded frame within this of the
+/// target counts as "the frame at the target", absorbing PTS rounding.
+const FRAME_EPS_S: f64 = 1e-3;
 
 /// Cap on frame-decoding threads for playback. Frame threading delays the first
 /// output by roughly the thread count: the pipeline must fill before frame 0 is
@@ -53,6 +59,62 @@ pub struct PlaybackFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// A command to the live playback decoder (see [`play_stream`]). One decoder
+/// thread stays open for the whole session and reacts to these, so seeking is a
+/// flush rather than a fresh decode.
+pub enum PlayCommand {
+    /// Seek to `time_s`, emit exactly that frame, then hold (scrub preview).
+    Scrub(f64),
+    /// Seek to `time_s` and play forward from there in real time.
+    Play(f64),
+    /// Hold on the current frame.
+    Pause,
+    /// Resume playing from the current position.
+    Resume,
+    /// End playback; `play_stream` returns `Ok(())`.
+    Stop,
+}
+
+/// Mutable state of the playback state machine, mutated by [`PlayCommand`]s.
+struct PlayState {
+    /// Holding on the current frame (paused, or scrub between moves).
+    paused: bool,
+    /// Skip decoded frames earlier than this media time (precise-seek landing).
+    skip_until: Option<f64>,
+    /// After emitting the next frame, hold on it (used by `Scrub`).
+    hold_after: bool,
+    /// Wall/media clock anchor for real-time pacing; reset on every seek.
+    anchor: Option<(Instant, f64)>,
+    /// A seek to apply before decoding resumes: `(time_s, precise)`. `precise`
+    /// skips forward to the exact frame; otherwise playback opens at the keyframe.
+    pending_seek: Option<(f64, bool)>,
+}
+
+impl PlayState {
+    /// Fold a command into the state. Returns `false` on `Stop` (end playback).
+    fn apply(&mut self, cmd: PlayCommand) -> bool {
+        match cmd {
+            PlayCommand::Scrub(t) => {
+                self.pending_seek = Some((t, true));
+                self.hold_after = true;
+                self.paused = false;
+            }
+            PlayCommand::Play(t) => {
+                self.pending_seek = Some((t, true));
+                self.hold_after = false;
+                self.paused = false;
+            }
+            PlayCommand::Pause => self.paused = true,
+            PlayCommand::Resume => {
+                self.paused = false;
+                self.anchor = None;
+            }
+            PlayCommand::Stop => return false,
+        }
+        true
+    }
 }
 
 /// Clip metadata, reported once before any thumbnail.
@@ -279,20 +341,23 @@ pub fn extract_grid(path: &Path, spacing_s: f64, thumb_long_side: u32) -> anyhow
     })
 }
 
-/// Play `path` from the keyframe just before `start_from_s`, decoding every
-/// frame forward and handing each to `on_frame` in presentation order.
+/// Play `path` with one long-lived decoder driven by [`PlayCommand`]s over
+/// `commands`, handing each due frame to `on_frame` in presentation order.
 ///
 /// Unlike [`extract_grid_streaming`] this decodes the full P/B stream, not just
-/// keyframes, so it produces continuous motion. It first seeks backward to the
-/// keyframe preceding `start_from_s` (a thumbnail time from the grid) so
-/// playback opens a little earlier than the picked frame — see [`SEEK_BACK_US`].
+/// keyframes, so it produces continuous motion, and it paces frames to real time
+/// itself (the UI just displays what arrives). Playback opens at the keyframe
+/// before `start_from_s` — see [`SEEK_BACK_US`]. Thereafter a `Scrub`/`Play`
+/// command seeks by flushing this same decoder and skipping forward to the exact
+/// target frame, so scrubbing shows precise frames without reopening the file.
 /// Frames are scaled to fit a box whose long side is `long_side`. `on_frame`
-/// returns `false` to stop early (e.g. the UI closed the player); decoding then
-/// ends and the call returns `Ok(())`.
+/// returns `false` to stop (the UI closed the player); `Stop`, a closed command
+/// channel, or end-of-stream during playback also end the call with `Ok(())`.
 pub fn play_stream(
     path: &Path,
     start_from_s: f64,
     long_side: u32,
+    commands: Receiver<PlayCommand>,
     mut on_frame: impl FnMut(PlaybackFrame) -> bool,
 ) -> anyhow::Result<()> {
     let mut ictx = input(path)?;
@@ -332,78 +397,170 @@ pub fn play_stream(
         Flags::BILINEAR,
     )?;
 
-    // Seek to the keyframe at or before (target − ε). avformat_seek_file with a
-    // max of `target_us` lands on the newest keyframe not after it; ε steps past
-    // the picked frame's own keyframe onto the previous one. Absolute stream
-    // microseconds, so add back `start_s` (files often start at a non-zero PTS).
-    let target_us = (((start_from_s + start_s) * AV_TIME_BASE) as i64 - SEEK_BACK_US).max(0);
-    ictx.seek(target_us, ..target_us)?;
-    decoder.flush();
+    let mut st = PlayState {
+        paused: false,
+        skip_until: None,
+        hold_after: false,
+        anchor: None,
+        // Initial start: keyframe-before, matching a grid-cell click.
+        pending_seek: Some((start_from_s, false)),
+    };
+    // Demux/decoder end-of-stream flags, reset on every seek.
+    let mut demux_eof = false;
+    let mut eof_sent = false;
 
-    for (s, packet) in ictx.packets() {
-        if s.index() != stream_index {
-            continue;
-        }
-        decoder.send_packet(&packet).ok();
-        if !drain_playback(
-            &mut decoder,
-            &mut scaler,
-            tb_secs,
-            start_s,
-            out_w,
-            out_h,
-            &mut on_frame,
-        )? {
-            return Ok(());
-        }
-    }
-
-    // Flush frames still buffered by the threaded decoder at end-of-stream.
-    decoder.send_eof().ok();
-    drain_playback(
-        &mut decoder,
-        &mut scaler,
-        tb_secs,
-        start_s,
-        out_w,
-        out_h,
-        &mut on_frame,
-    )?;
-
-    Ok(())
-}
-
-/// Drain every frame currently available from the decoder, emitting a
-/// [`PlaybackFrame`] for each. Returns `Ok(false)` as soon as `on_frame` asks to
-/// stop, `Ok(true)` when the decoder is drained.
-#[allow(clippy::too_many_arguments)]
-fn drain_playback(
-    decoder: &mut ffmpeg::decoder::Video,
-    scaler: &mut Scaler,
-    tb_secs: f64,
-    start_s: f64,
-    out_w: u32,
-    out_h: u32,
-    on_frame: &mut impl FnMut(PlaybackFrame) -> bool,
-) -> anyhow::Result<bool> {
     loop {
-        let mut frame = Video::empty();
-        if decoder.receive_frame(&mut frame).is_err() {
-            break;
+        // Apply a pending seek: land on the keyframe at or before (target − ε) and
+        // flush, so the decoder resumes cleanly from the new position.
+        if let Some((t, precise)) = st.pending_seek.take() {
+            let target_us = (((t + start_s) * AV_TIME_BASE) as i64 - SEEK_BACK_US).max(0);
+            ictx.seek(target_us, ..target_us)?;
+            decoder.flush();
+            st.skip_until = precise.then_some(t);
+            st.anchor = None;
+            demux_eof = false;
+            eof_sent = false;
         }
+
+        // Paused (or scrub-holding): block until a command wakes us.
+        if st.paused {
+            match commands.recv() {
+                Ok(cmd) => {
+                    if !st.apply(cmd) {
+                        return Ok(()); // Stop
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(()), // channel closed
+            }
+        }
+
+        // Drain any queued command without blocking; a command restarts the loop.
+        match commands.try_recv() {
+            Ok(cmd) => {
+                if !st.apply(cmd) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return Ok(()),
+        }
+
+        // Decode the next frame.
+        let frame = match next_frame(
+            &mut ictx,
+            &mut decoder,
+            stream_index,
+            &mut demux_eof,
+            &mut eof_sent,
+        )? {
+            Some(f) => f,
+            None => {
+                // Reached the end (played through to it, or sought past it):
+                // hold on the last frame instead of ending, so playback stays
+                // up rather than kicking back to the grid. Escape/Stop from the
+                // UI still exits, and scrubbing back seeks and resumes.
+                st.skip_until = None;
+                st.paused = true;
+                continue;
+            }
+        };
         let time_s = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
-        let t = scale_thumb(scaler, &frame, out_w, out_h, time_s)?;
-        let ok = on_frame(PlaybackFrame {
+
+        // Skip decoded frames before a precise seek target so scrubbing lands on
+        // the exact frame rather than the keyframe.
+        if let Some(u) = st.skip_until {
+            if time_s + FRAME_EPS_S < u {
+                continue;
+            }
+            st.skip_until = None;
+        }
+
+        // Pace to real time, but let a command preempt the wait (drop this frame).
+        match st.anchor {
+            None => st.anchor = Some((Instant::now(), time_s)),
+            Some((wall0, media0)) => {
+                let due = wall0 + Duration::from_secs_f64((time_s - media0).max(0.0));
+                // Wait until the frame is due, but let a command preempt the wait
+                // (dropping this frame — the command seeks or pauses anyway).
+                let mut preempted = false;
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    match commands.recv_timeout(wait) {
+                        Ok(cmd) => {
+                            if !st.apply(cmd) {
+                                return Ok(());
+                            }
+                            preempted = true;
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    }
+                }
+                if preempted {
+                    continue;
+                }
+            }
+        }
+
+        // Emit the frame.
+        let t = scale_thumb(&mut scaler, &frame, out_w, out_h, time_s)?;
+        if !on_frame(PlaybackFrame {
             time_s: t.time_s,
             width: t.width,
             height: t.height,
             rgba: t.rgba,
-        });
-        if !ok {
-            return Ok(false);
+        }) {
+            return Ok(());
+        }
+        // Scrub shows one frame at the target, then holds on it.
+        if st.hold_after {
+            st.hold_after = false;
+            st.paused = true;
         }
     }
-    Ok(true)
+}
+
+/// Decode the next frame, pulling packets on demand. Returns `Ok(None)` only when
+/// the stream is fully drained. `demux_eof`/`eof_sent` track end-of-stream across
+/// calls and must be reset after a seek/flush.
+fn next_frame(
+    ictx: &mut ffmpeg::format::context::Input,
+    decoder: &mut ffmpeg::decoder::Video,
+    stream_index: usize,
+    demux_eof: &mut bool,
+    eof_sent: &mut bool,
+) -> anyhow::Result<Option<Video>> {
+    loop {
+        let mut frame = Video::empty();
+        match decoder.receive_frame(&mut frame) {
+            Ok(()) => return Ok(Some(frame)),
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {}
+            Err(ffmpeg::Error::Eof) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+
+        if *demux_eof {
+            if !*eof_sent {
+                decoder.send_eof().ok();
+                *eof_sent = true;
+                continue;
+            }
+            return Ok(None); // fully drained
+        }
+
+        // Read one video packet; the iterator is dropped each call so `ictx` is
+        // free to seek between frames.
+        let packet = ictx
+            .packets()
+            .find_map(|(s, p)| (s.index() == stream_index).then_some(p));
+        match packet {
+            Some(p) => {
+                decoder.send_packet(&p).ok();
+            }
+            None => *demux_eof = true,
+        }
+    }
 }
 
 /// Fit into a box whose long side is `long`, preserving aspect, even dimensions.
@@ -444,4 +601,70 @@ fn scale_thumb(
         height: h,
         rgba: buf,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    fn test_video(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("test_videos")
+            .join(name)
+    }
+
+    /// A `Scrub` command lands the decoder on the exact frame at the target time,
+    /// not the keyframe before it — the whole point of the live seek.
+    #[test]
+    fn scrub_lands_on_the_target_frame() {
+        init().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel::<f64>();
+        let path = test_video("counter_25s_vertical.mp4");
+
+        let worker = std::thread::spawn(move || {
+            play_stream(&path, 0.0, 320, cmd_rx, |f| frame_tx.send(f.time_s).is_ok())
+        });
+
+        // Wait for playback to produce a first frame, then scrub to 12s.
+        frame_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no first frame");
+        cmd_tx.send(PlayCommand::Scrub(12.0)).unwrap();
+
+        // The scrubbed frame should arrive within a frame of the target.
+        let mut landed = None;
+        while let Ok(t) = frame_rx.recv_timeout(Duration::from_secs(10)) {
+            if (t - 12.0).abs() < 0.05 {
+                landed = Some(t);
+                break;
+            }
+        }
+        cmd_tx.send(PlayCommand::Stop).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert!(landed.is_some(), "scrub did not land near 12s: {landed:?}");
+    }
+
+    /// `Stop` (and a dropped command channel) ends `play_stream` cleanly.
+    #[test]
+    fn stop_ends_playback() {
+        init().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel::<f64>();
+        let path = test_video("counter_25s_vertical.mp4");
+
+        let worker = std::thread::spawn(move || {
+            play_stream(&path, 0.0, 320, cmd_rx, |f| frame_tx.send(f.time_s).is_ok())
+        });
+
+        frame_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no first frame");
+        cmd_tx.send(PlayCommand::Stop).unwrap();
+        worker.join().unwrap().unwrap();
+    }
 }
