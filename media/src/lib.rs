@@ -408,6 +408,9 @@ pub fn play_stream(
     // Demux/decoder end-of-stream flags, reset on every seek.
     let mut demux_eof = false;
     let mut eof_sent = false;
+    // Most recent frame skipped while precise-seeking; emitted if the seek target
+    // lies past the last frame, so stepping/scrubbing to the end lands on it.
+    let mut last_skipped: Option<Video> = None;
 
     loop {
         // Apply a pending seek: land on the keyframe at or before (target − ε) and
@@ -420,6 +423,7 @@ pub fn play_stream(
             st.anchor = None;
             demux_eof = false;
             eof_sent = false;
+            last_skipped = None;
         }
 
         // Paused (or scrub-holding): block until a command wakes us.
@@ -456,25 +460,38 @@ pub fn play_stream(
             &mut eof_sent,
         )? {
             Some(f) => f,
-            None => {
-                // Reached the end (played through to it, or sought past it):
-                // hold on the last frame instead of ending, so playback stays
-                // up rather than kicking back to the grid. Escape/Stop from the
-                // UI still exits, and scrubbing back seeks and resumes.
-                st.skip_until = None;
-                st.paused = true;
-                continue;
-            }
+            None => match last_skipped.take() {
+                // End of stream while still skipping toward a precise seek target
+                // past the last frame: land on the final frame we buffered so a
+                // step/scrub to the very end shows it instead of nothing.
+                Some(f) if st.skip_until.is_some() => {
+                    st.skip_until = None;
+                    st.hold_after = true;
+                    f
+                }
+                _ => {
+                    // Reached the end (played through to it, or sought past it):
+                    // hold on the last frame instead of ending, so playback stays
+                    // up rather than kicking back to the grid. Escape/Stop from the
+                    // UI still exits, and scrubbing back seeks and resumes.
+                    st.skip_until = None;
+                    st.paused = true;
+                    continue;
+                }
+            },
         };
         let time_s = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
 
         // Skip decoded frames before a precise seek target so scrubbing lands on
-        // the exact frame rather than the keyframe.
+        // the exact frame rather than the keyframe. Buffer the last skipped frame
+        // so end-of-stream can fall back to it (see above).
         if let Some(u) = st.skip_until {
             if time_s + FRAME_EPS_S < u {
+                last_skipped = Some(frame);
                 continue;
             }
             st.skip_until = None;
+            last_skipped = None;
         }
 
         // Pace to real time, but let a command preempt the wait (drop this frame).

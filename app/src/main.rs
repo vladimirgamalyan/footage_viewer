@@ -13,6 +13,10 @@ use std::thread;
 use eframe::egui;
 use footage_viewer_media as media;
 
+// Startup self-update; compiled only into the release build the tester runs.
+#[cfg(not(debug_assertions))]
+mod update;
+
 const THUMB_SPACING_S: f64 = 1.0;
 const THUMB_LONG: u32 = 320;
 const GRID_COLS: usize = 4;
@@ -30,6 +34,15 @@ const SCRUB_INTERVAL_S: f64 = 0.08;
 /// dragging. Holding within this of the current position keeps the frozen frame
 /// instead of restarting the decoder on the same spot.
 const SCRUB_MIN_STEP_S: f64 = 0.05;
+
+/// How far A/D nudge the playback position, in media seconds.
+const SEEK_STEP_S: f64 = 0.5;
+
+/// Hold delay before A/D key-repeat kicks in, in seconds.
+const SEEK_REPEAT_DELAY_S: f64 = 0.35;
+
+/// Interval between repeated A/D seeks while the key is held, in seconds.
+const SEEK_REPEAT_INTERVAL_S: f64 = 0.12;
 
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
@@ -71,6 +84,12 @@ fn neighbor_of(current: &Path, delta: i32) -> Option<PathBuf> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Pull the latest published build before anything else, so the tester always
+    // runs the newest version. Replaces this exe and relaunches if one is found;
+    // a no-op in debug builds.
+    #[cfg(not(debug_assertions))]
+    update::run();
+
     media::init().expect("failed to initialize ffmpeg");
 
     let pending = std::env::args().nth(1).map(PathBuf::from);
@@ -154,6 +173,12 @@ struct App {
     /// egui time of the last live seek fired while dragging the scrubber, for
     /// throttling (see [`SCRUB_INTERVAL_S`]).
     scrub_last_seek: f64,
+    /// A/D seek key-repeat state in the player: sign of the held seek key
+    /// (−1 A, +1 D, 0 none), the egui time the next repeat is due, and the
+    /// running target so fast repeats accumulate even when frames lag behind.
+    seek_dir: i32,
+    seek_next_fire: f64,
+    seek_target: f64,
     error: Option<String>,
 }
 
@@ -371,7 +396,8 @@ impl App {
     /// the video area, Tab, or a decode error returns to the grid; Escape closes
     /// the app. A scrubber along the bottom shows the position and seeks on drag or
     /// click. Left/Right play the previous/next sibling clip from its start,
-    /// staying in playback; Space pauses.
+    /// staying in playback; Space pauses; A/D nudge the position back/forward
+    /// by half a second (auto-repeating on hold) and pause on that frame.
     fn playback_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Left/Right switch to the previous/next sibling clip and keep playing:
         // open() loads the new clip (and kicks off its background grid), then we
@@ -419,6 +445,38 @@ impl App {
         // repaint per frame, and mouse motion drives repaints while dragging.
         let now = ctx.input(|i| i.time);
         let duration_s = self.loaded.as_ref().map(|l| l.duration_s).unwrap_or(0.0);
+
+        // A/D nudge the live position back/forward by half a second and pause
+        // on the landed frame. Repeat is driven off a timer (egui key events
+        // don't reliably auto-repeat here), and we request repaints while a key
+        // is held so the timer keeps ticking even though playback is paused.
+        let dir = ctx.input(|i| {
+            i.key_down(egui::Key::D) as i32 - i.key_down(egui::Key::A) as i32
+        });
+        if dir == 0 {
+            self.seek_dir = 0;
+        } else {
+            if let Some(p) = &mut self.player {
+                let start = dir != self.seek_dir;
+                // Only fire the next step once the previous one has landed (the
+                // shown frame reached the target). Each Scrub is a keyframe seek
+                // plus decode, slower than the repeat interval, so firing blindly
+                // backs up the command channel and stalls; gating on arrival
+                // paces us to the decoder and keeps at most one seek in flight.
+                let landed = (p.position_s - self.seek_target).abs() < SEEK_STEP_S * 0.5;
+                if start || (now >= self.seek_next_fire && landed) {
+                    let base = if start { p.position_s } else { self.seek_target };
+                    let target = (base + dir as f64 * SEEK_STEP_S).clamp(0.0, duration_s);
+                    self.seek_target = target;
+                    p.paused = true;
+                    let _ = p.cmds.send(media::PlayCommand::Scrub(target));
+                    self.seek_dir = dir;
+                    self.seek_next_fire =
+                        now + if start { SEEK_REPEAT_DELAY_S } else { SEEK_REPEAT_INTERVAL_S };
+                }
+            }
+            ctx.request_repaint();
+        }
 
         // Full-window black backdrop: the frame is letterboxed above a scrubber
         // strip. A click in the video area returns to the grid; the scrubber
@@ -472,9 +530,10 @@ impl App {
 /// Draw the playback scrubber into `rect` and handle interaction, VLC-style: a
 /// click jumps playback there, and dragging anywhere on the bar seeks live (the
 /// decoder shows the exact frame at the cursor and holds); releasing resumes
-/// playback from that spot. The handle just reflects the position. Returns the
-/// `PlayCommand` to send this frame — a held `Scrub` while dragging (throttled),
-/// or a `Play` on click/release — else `None`.
+/// playback from that spot, or holds there if playback was paused. The handle
+/// just reflects the position. Returns the `PlayCommand` to send this frame — a
+/// held `Scrub` while dragging (throttled), or a `Play`/`Scrub` (per pause state)
+/// on click/release — else `None`.
 fn seek_bar_ui(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -492,6 +551,18 @@ fn seek_bar_ui(
     let y = rect.center().y;
     let time_at_x = |x: f32| ((x - left) / track_w).clamp(0.0, 1.0) as f64 * duration_s;
 
+    // A finished seek resumes playback, unless it was paused before the seek —
+    // then hold on the landed frame (Scrub) so a mouse seek doesn't silently
+    // start playing and desync the Space pause toggle.
+    let paused = player.paused;
+    let seek_cmd = |t: f64| {
+        if paused {
+            media::PlayCommand::Scrub(t)
+        } else {
+            media::PlayCommand::Play(t)
+        }
+    };
+
     let mut cmd = None;
     if resp.dragged() {
         if let Some(pos) = resp.interact_pointer_pos() {
@@ -507,12 +578,12 @@ fn seek_bar_ui(
             }
         }
     } else if let Some(target) = player.scrub.take() {
-        // Drag released: seek to the exact spot and resume normal playback.
-        cmd = Some(media::PlayCommand::Play(target));
+        // Drag released: seek to the exact spot; resume or hold per the pause state.
+        cmd = Some(seek_cmd(target));
     }
     if resp.clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
-            cmd = Some(media::PlayCommand::Play(time_at_x(pos.x)));
+            cmd = Some(seek_cmd(time_at_x(pos.x)));
         }
     }
 

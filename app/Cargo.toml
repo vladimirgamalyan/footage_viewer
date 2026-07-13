@@ -1,12 +1,16 @@
 [package]
 name = "footage_viewer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 footage-viewer-media = { path = "../media" }
 eframe = "0.35"
 rfd = "0.15"
+# Self-update from GitHub Releases on startup. archive-zip lets it unpack the
+# published `<name>-<version>-<target>.zip` asset; default-tls uses Windows
+# SChannel (no OpenSSL needed).
+self_update = { version = "0.44", features = ["archive-zip", "compression-zip-deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
