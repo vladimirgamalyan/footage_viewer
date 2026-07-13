@@ -24,6 +24,13 @@ pub struct Thumbnail {
     pub rgba: Vec<u8>,
 }
 
+/// Clip metadata, reported once before any thumbnail.
+pub struct GridMeta {
+    pub duration_s: f64,
+    pub src_w: u32,
+    pub src_h: u32,
+}
+
 /// The whole grid plus source metadata.
 pub struct Grid {
     pub duration_s: f64,
@@ -38,12 +45,20 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Extract `cells` thumbnails evenly spaced across the clip.
+/// Extract `cells` thumbnails evenly spaced across the clip, streaming them out.
 ///
-/// Decodes the video stream once, top to bottom, emitting the first frame at or
-/// after each target time. Thumbnails fit into a box whose long side is
-/// `thumb_long_side`, preserving aspect.
-pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::Result<Grid> {
+/// Decodes the video stream once, top to bottom. `on_meta` is called once with
+/// clip metadata, then `on_thumb(index, thumbnail)` is called for each cell in
+/// order (index `0..cells`) as it becomes ready — so a caller can fill a grid
+/// progressively. Thumbnails fit into a box whose long side is `thumb_long_side`,
+/// preserving aspect.
+pub fn extract_grid_streaming(
+    path: &Path,
+    cells: usize,
+    thumb_long_side: u32,
+    mut on_meta: impl FnMut(GridMeta),
+    mut on_thumb: impl FnMut(usize, Thumbnail),
+) -> anyhow::Result<()> {
     let mut ictx = input(path)?;
 
     let stream = ictx
@@ -70,6 +85,12 @@ pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::
     )?;
 
     let duration_s = ictx.duration() as f64 / AV_TIME_BASE;
+    on_meta(GridMeta {
+        duration_s,
+        src_w,
+        src_h,
+    });
+
     // Sample at the center of each of the N equal time slices.
     let target_pts: Vec<i64> = (0..cells)
         .map(|i| {
@@ -78,7 +99,6 @@ pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::
         })
         .collect();
 
-    let mut thumbs = Vec::with_capacity(cells);
     let mut next = 0usize;
     let mut last: Option<Video> = None;
 
@@ -95,7 +115,8 @@ pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::
             let pts = frame.pts().unwrap_or(i64::MIN);
             // One frame may satisfy several targets if slices are short.
             while next < cells && pts >= target_pts[next] {
-                thumbs.push(scale_thumb(&mut scaler, &frame, out_w, out_h, pts as f64 * tb_secs)?);
+                let thumb = scale_thumb(&mut scaler, &frame, out_w, out_h, pts as f64 * tb_secs)?;
+                on_thumb(next, thumb);
                 next += 1;
             }
             if next >= cells {
@@ -110,16 +131,32 @@ pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::
         if let Some(frame) = last.as_ref() {
             let t = frame.pts().unwrap_or(0) as f64 * tb_secs;
             while next < cells {
-                thumbs.push(scale_thumb(&mut scaler, frame, out_w, out_h, t)?);
+                let thumb = scale_thumb(&mut scaler, frame, out_w, out_h, t)?;
+                on_thumb(next, thumb);
                 next += 1;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Extract the whole grid at once (convenience wrapper over [`extract_grid_streaming`]).
+pub fn extract_grid(path: &Path, cells: usize, thumb_long_side: u32) -> anyhow::Result<Grid> {
+    let mut meta: Option<GridMeta> = None;
+    let mut thumbs = Vec::with_capacity(cells);
+    extract_grid_streaming(
+        path,
+        cells,
+        thumb_long_side,
+        |m| meta = Some(m),
+        |_, t| thumbs.push(t),
+    )?;
+    let meta = meta.ok_or_else(|| anyhow::anyhow!("no metadata produced"))?;
     Ok(Grid {
-        duration_s,
-        src_w,
-        src_h,
+        duration_s: meta.duration_s,
+        src_w: meta.src_w,
+        src_h: meta.src_h,
         thumbs,
     })
 }

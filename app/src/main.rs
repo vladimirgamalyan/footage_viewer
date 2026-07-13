@@ -1,12 +1,14 @@
 //! footage_viewer — open a clip and see a grid of frames sampled across it.
 //!
-//! Skeleton: synchronous extract-on-open + grid render. Background extraction and
-//! progressive fill (see docs/concept.md) come next.
+//! Extraction runs on a background thread and streams thumbnails back; the grid
+//! fills in progressively so the window never blocks on open.
 
 // In release, build as a Windows GUI app so launching from Explorer doesn't flash a console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use eframe::egui;
 use footage_viewer_media as media;
@@ -31,12 +33,29 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// A loaded clip: its grid uploaded as GPU textures.
+/// Messages from the extraction worker to the UI.
+enum Msg {
+    Meta(media::GridMeta),
+    Thumb(usize, media::Thumbnail),
+    Done,
+    Err(String),
+}
+
+/// One grid cell: waiting to be decoded, or an uploaded texture.
+enum Cell {
+    Pending,
+    Ready(egui::TextureHandle),
+}
+
+/// A clip being (or already) loaded.
 struct Loaded {
     path: PathBuf,
     duration_s: f64,
-    textures: Vec<egui::TextureHandle>,
     aspect: f32, // height / width of a thumbnail
+    cells: Vec<Cell>,
+    ready: usize,
+    done: bool,
+    rx: Receiver<Msg>,
 }
 
 #[derive(Default)]
@@ -54,35 +73,84 @@ impl App {
         }
     }
 
+    /// Kick off background extraction; returns immediately.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        match media::extract_grid(&path, GRID_N, THUMB_LONG) {
-            Ok(grid) => {
-                let textures = grid
-                    .thumbs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
+        self.error = None;
+
+        let (tx, rx) = mpsc::channel();
+        let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
+        let (ctx_meta, ctx_thumb, ctx_end) = (ctx.clone(), ctx.clone(), ctx.clone());
+        let worker_path = path.clone();
+
+        thread::spawn(move || {
+            let result = media::extract_grid_streaming(
+                &worker_path,
+                GRID_N,
+                THUMB_LONG,
+                move |m| {
+                    let _ = tx_meta.send(Msg::Meta(m));
+                    ctx_meta.request_repaint();
+                },
+                move |i, t| {
+                    let _ = tx_thumb.send(Msg::Thumb(i, t));
+                    ctx_thumb.request_repaint();
+                },
+            );
+            let _ = match result {
+                Ok(()) => tx.send(Msg::Done),
+                Err(e) => tx.send(Msg::Err(format!("{e:#}"))),
+            };
+            ctx_end.request_repaint();
+        });
+
+        self.loaded = Some(Loaded {
+            path,
+            duration_s: 0.0,
+            aspect: 9.0 / 16.0,
+            cells: (0..GRID_N).map(|_| Cell::Pending).collect(),
+            ready: 0,
+            done: false,
+            rx,
+        });
+    }
+
+    /// Drain whatever the worker has produced since the last frame.
+    fn poll(&mut self, ctx: &egui::Context) {
+        let mut failed: Option<String> = None;
+        if let Some(l) = &mut self.loaded {
+            while !l.done {
+                match l.rx.try_recv() {
+                    Ok(Msg::Meta(m)) => {
+                        l.duration_s = m.duration_s;
+                        if m.src_w > 0 {
+                            l.aspect = m.src_h as f32 / m.src_w as f32;
+                        }
+                    }
+                    Ok(Msg::Thumb(i, t)) => {
                         let img = egui::ColorImage::from_rgba_unmultiplied(
                             [t.width as usize, t.height as usize],
                             &t.rgba,
                         );
-                        ctx.load_texture(format!("thumb_{i}"), img, egui::TextureOptions::default())
-                    })
-                    .collect();
-                let aspect = grid
-                    .thumbs
-                    .first()
-                    .map(|t| t.height as f32 / t.width as f32)
-                    .unwrap_or(9.0 / 16.0);
-                self.loaded = Some(Loaded {
-                    path,
-                    duration_s: grid.duration_s,
-                    textures,
-                    aspect,
-                });
-                self.error = None;
+                        let tex =
+                            ctx.load_texture(format!("thumb_{i}"), img, egui::TextureOptions::default());
+                        if let Some(cell) = l.cells.get_mut(i) {
+                            *cell = Cell::Ready(tex);
+                            l.ready += 1;
+                        }
+                    }
+                    Ok(Msg::Done) => l.done = true,
+                    Ok(Msg::Err(e)) => {
+                        failed = Some(e);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => l.done = true,
+                }
             }
-            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+        if let Some(e) = failed {
+            self.error = Some(e);
+            self.loaded = None;
         }
     }
 }
@@ -102,6 +170,8 @@ impl eframe::App for App {
             self.open(&ctx, path);
         }
 
+        self.poll(&ctx);
+
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open video…").clicked() {
@@ -120,6 +190,11 @@ impl eframe::App for App {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     ui.label(format!("{name}  ·  {:.1}s", l.duration_s));
+                    if !l.done {
+                        ui.separator();
+                        ui.add(egui::Spinner::new());
+                        ui.label(format!("{}/{}", l.ready, l.cells.len()));
+                    }
                 }
             });
         });
@@ -136,20 +211,29 @@ impl eframe::App for App {
                 return;
             };
 
-            let cols = (l.textures.len() as f64).sqrt().ceil() as usize;
+            let cols = (l.cells.len() as f64).sqrt().ceil() as usize;
             let spacing = 6.0f32;
             let avail = ui.available_width();
             let cell_w = ((avail - spacing * (cols as f32 + 1.0)) / cols as f32).max(80.0);
             let cell_h = cell_w * l.aspect;
+            let size = egui::vec2(cell_w, cell_h);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("frame_grid")
                     .spacing([spacing, spacing])
                     .show(ui, |ui| {
-                        for (i, tex) in l.textures.iter().enumerate() {
-                            let sized =
-                                egui::load::SizedTexture::new(tex.id(), egui::vec2(cell_w, cell_h));
-                            ui.add(egui::Image::from_texture(sized));
+                        for (i, cell) in l.cells.iter().enumerate() {
+                            match cell {
+                                Cell::Ready(tex) => {
+                                    let sized = egui::load::SizedTexture::new(tex.id(), size);
+                                    ui.add(egui::Image::from_texture(sized));
+                                }
+                                Cell::Pending => {
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(size, egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(35));
+                                }
+                            }
                             if (i + 1) % cols == 0 {
                                 ui.end_row();
                             }
