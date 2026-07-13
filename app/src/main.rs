@@ -90,7 +90,11 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("footage_viewer")
-            .with_inner_size([1000.0, 720.0]),
+            .with_inner_size([1000.0, 720.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../icon.png"))
+                    .expect("bundled icon.png is a valid PNG"),
+            ),
         ..Default::default()
     };
     eframe::run_native(

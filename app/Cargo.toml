@@ -14,3 +14,7 @@ self_update = { version = "0.44", features = ["archive-zip", "compression-zip-de
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+# Embeds the application icon (icon.ico) into the Windows executable.
+winresource = "0.1"
