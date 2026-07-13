@@ -17,14 +17,24 @@ build — while keeping the maintainer's cost to one command.
 
 ## Decision
 
-**Self-update from GitHub Releases on startup.** On release-build launch, before
-FFmpeg init and the window, `app/src/update.rs` asks the public repo for its
-latest release via the `self_update` crate. If the release tag is newer than the
-compiled `CARGO_PKG_VERSION`, it downloads the Windows asset, replaces the running
-exe in place (`self_replace`), tells the tester with a native dialog, and
-relaunches. It is gated to `#[cfg(not(debug_assertions))]` so dev builds never
-hit the network. Every failure (offline, GitHub unreachable, rate-limited) is
-swallowed — the tester keeps running the current version.
+**Self-update from GitHub Releases on startup.** On release-build launch,
+`app/src/update.rs` asks the public repo for its latest release via the
+`self_update` crate. If the release tag is newer than the compiled
+`CARGO_PKG_VERSION`, it downloads the Windows asset, replaces the running exe in
+place (`self_replace`), and relaunches. It is gated to
+`#[cfg(not(debug_assertions))]` so dev builds never hit the network. Every failure
+(offline, GitHub unreachable, rate-limited) is swallowed — the tester keeps
+running the current version.
+
+**The check runs behind an in-window overlay, not a pre-window block.** The check
+and download run on a background thread while the window shows a spinner and a
+phase label ("Checking for updates…" → "Downloading update…"), so the tester
+always sees motion instead of a silent multi-second hang before the window
+appears. When an update lands, the overlay reads "Updated to vX. Restarting…" for
+a beat and the app relaunches itself automatically — no dialog and no click. The
+normal UI (and any file passed on the command line) is held until the check
+resolves. `self_update` exposes no numeric download progress outside its terminal
+progress bar, so the indicator is an indeterminate spinner, not a percentage.
 
 **Only the exe ships per feature.** The DLLs live next to the exe and are left
 untouched, so a feature update is the ~14 MB exe (7.5 MB zipped), not the full
@@ -61,7 +71,8 @@ carrying the author's normal git identity.
 - Adds `self_update` → `reqwest`/`tokio` to the dependency graph (bigger release
   build, native-tls via Windows SChannel, no OpenSSL). Acceptable next to FFmpeg
   and eframe.
-- The update check adds one blocking HTTPS round-trip to release startup; on top
-  of the DLL-bound cold start (ADR-0001) it is minor, and it fails fast offline.
+- The update check runs off the UI thread, so it never blocks the window from
+  opening; the tester waits behind the spinner overlay only when an update is
+  actually downloading, and offline it fails fast and drops straight to the app.
 - Distribution now depends on the repo staying public and on GitHub Releases.
   Reversing to a private repo would require an embedded token or a different host.

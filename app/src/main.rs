@@ -84,12 +84,6 @@ fn neighbor_of(current: &Path, delta: i32) -> Option<PathBuf> {
 }
 
 fn main() -> eframe::Result<()> {
-    // Pull the latest published build before anything else, so the tester always
-    // runs the newest version. Replaces this exe and relaunches if one is found;
-    // a no-op in debug builds.
-    #[cfg(not(debug_assertions))]
-    update::run();
-
     media::init().expect("failed to initialize ffmpeg");
 
     let pending = std::env::args().nth(1).map(PathBuf::from);
@@ -180,6 +174,17 @@ struct App {
     seek_next_fire: f64,
     seek_target: f64,
     error: Option<String>,
+    /// Startup self-update: the background worker's channel, the phase text shown
+    /// in the overlay (`Some` while the check/download/restart is in flight), and
+    /// the egui time to relaunch at once an update has landed.
+    #[cfg(not(debug_assertions))]
+    update_started: bool,
+    #[cfg(not(debug_assertions))]
+    update_rx: Option<Receiver<update::Msg>>,
+    #[cfg(not(debug_assertions))]
+    update_status: Option<String>,
+    #[cfg(not(debug_assertions))]
+    relaunch_at: Option<f64>,
 }
 
 impl App {
@@ -188,6 +193,57 @@ impl App {
             pending_open: pending,
             ..Default::default()
         }
+    }
+
+    /// Drive the startup self-update: kick off the background check on the first
+    /// frame, drain its progress, and draw a spinner overlay while it runs.
+    /// Returns `true` while the overlay is up so the caller holds the normal UI;
+    /// relaunches (and never returns) if an update was applied.
+    #[cfg(not(debug_assertions))]
+    fn drive_update(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
+        if !self.update_started {
+            self.update_started = true;
+            self.update_status = Some("Checking for updates\u{2026}".to_string());
+            self.update_rx = Some(update::start(ctx.clone()));
+        }
+
+        if let Some(at) = self.relaunch_at {
+            // An update landed; the "restarting" notice has been shown, now go.
+            if ctx.input(|i| i.time) >= at {
+                update::relaunch(); // never returns
+            }
+        } else {
+            // Drain progress without holding a borrow across the state mutation.
+            while self.update_rx.is_some() {
+                match self.update_rx.as_ref().unwrap().try_recv() {
+                    Ok(update::Msg::Status(s)) => self.update_status = Some(s.to_string()),
+                    Ok(update::Msg::Updated(v)) => {
+                        self.update_status = Some(format!("Updated to {v}. Restarting\u{2026}"));
+                        self.relaunch_at = Some(ctx.input(|i| i.time) + 1.2);
+                        self.update_rx = None;
+                    }
+                    Ok(update::Msg::UpToDate)
+                    | Ok(update::Msg::Failed)
+                    | Err(mpsc::TryRecvError::Disconnected) => {
+                        self.update_rx = None;
+                        self.update_status = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+        }
+
+        let Some(status) = self.update_status.clone() else {
+            return false;
+        };
+        ctx.request_repaint(); // keep the spinner animating and the timer ticking
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.5 - 48.0).max(0.0));
+            ui.add(egui::Spinner::new().size(48.0));
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new(status).size(18.0));
+        });
+        true
     }
 
     /// Sibling `delta` positions from the currently loaded clip, or `None` at
@@ -633,6 +689,14 @@ fn fit_centered(container: egui::Rect, size: egui::Vec2) -> egui::Rect {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Release builds check for a newer published version on startup and show
+        // a spinner while it downloads; hold the normal UI (and the pending-file
+        // open below) until that resolves.
+        #[cfg(not(debug_assertions))]
+        if self.drive_update(ui, &ctx) {
+            return;
+        }
 
         // Open from the command line on the first frame.
         if let Some(path) = self.pending_open.take() {
