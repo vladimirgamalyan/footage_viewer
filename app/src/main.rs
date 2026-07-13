@@ -392,6 +392,29 @@ impl App {
         }
     }
 
+    /// Send the currently loaded clip to the recycle bin without confirmation
+    /// and return the sibling to open next — the following clip, or the previous
+    /// one if the deleted clip was the last in its folder. Returns `None` when
+    /// nothing is loaded, the delete failed (reason recorded in `self.error`), or
+    /// the folder is now empty; in the empty case the loaded/playing state is
+    /// cleared here so the caller can simply return to the empty view.
+    fn delete_current(&mut self) -> Option<PathBuf> {
+        let path = self.loaded.as_ref()?.path.clone();
+        // Resolve the neighbor before deleting, while the clip still lists.
+        let target = self.neighbor(1).or_else(|| self.neighbor(-1));
+        if let Err(e) = trash::delete(&path) {
+            self.error = Some(format!("Failed to delete {}: {e}", path.display()));
+            return None;
+        }
+        if target.is_none() {
+            // Deleted the only clip in the folder — nothing left to show.
+            self.player = None;
+            self.loaded = None;
+            self.resume_from_s = 0.0;
+        }
+        target
+    }
+
     /// Leave playback for the grid, remembering the current position so Tab can
     /// resume there. A no-op when nothing is playing.
     fn stop_playback(&mut self) {
@@ -427,6 +450,16 @@ impl App {
         if let Some(path) = neighbor {
             self.open(ctx, path);
             self.play(ctx, 0.0);
+            return;
+        }
+
+        // DEL sends the current clip to the recycle bin and moves to the next,
+        // staying in playback (or dropping to the empty grid if it was the last).
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            if let Some(next) = self.delete_current() {
+                self.open(ctx, next);
+                self.play(ctx, 0.0);
+            }
             return;
         }
 
@@ -682,6 +715,14 @@ impl eframe::App for App {
         // ESC quits.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // DEL sends the current clip to the recycle bin and opens the next one.
+        if self.loaded.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            if let Some(next) = self.delete_current() {
+                self.open(&ctx, next);
+            }
+            return;
         }
 
         // A clip to open this frame, from a button, an arrow key, or the dialog.

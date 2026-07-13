@@ -1,3 +1,1 @@
 Cache at the root of the disk you are viewing; disabled for permanent disks, only for mounted/removable disks.
-
-In both storyboard and player modes, DEL sends the file to the recycle bin (without confirmation) and moves to the next file.
