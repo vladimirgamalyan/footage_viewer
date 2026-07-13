@@ -7,7 +7,11 @@ edition = "2021"
 # UI-agnostic (no egui) — returns raw RGBA so the app can build textures.
 
 [dependencies]
-ffmpeg-next = "8.1"
+# Only decode (avcodec), demux (avformat), and RGBA scaling (swscale) are used.
+# Dropping the default `device`/`filter`/`software-resampling` features stops the
+# linker from importing avdevice/avfilter/swresample (~34 MB of DLLs), which the
+# Windows loader would otherwise map and scan before main() on every launch.
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 anyhow = "1"
 
 [dev-dependencies]
