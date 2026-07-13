@@ -138,6 +138,8 @@ struct Loaded {
     ready: usize,
     done: bool,
     rx: Receiver<Msg>,
+    /// Selected grid cell, moved with AWSD; Enter plays it.
+    cursor: usize,
 }
 
 #[derive(Default)]
@@ -211,6 +213,7 @@ impl App {
             ready: 0,
             done: false,
             rx,
+            cursor: 0,
         });
     }
 
@@ -532,6 +535,21 @@ fn seek_bar_ui(
     cmd
 }
 
+/// New cursor index after moving `(dx, dy)` cells within a `cols`-wide grid of
+/// `n` cells. Clamps at the edges (no wrap) and to the last, possibly partial,
+/// row so the cursor never lands past the streamed thumbnails.
+fn move_cursor(cursor: usize, n: usize, cols: usize, dx: i32, dy: i32) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let rows = n.div_ceil(cols);
+    let row = (cursor / cols) as i32;
+    let col = (cursor % cols) as i32;
+    let new_col = (col + dx).clamp(0, cols as i32 - 1);
+    let new_row = (row + dy).clamp(0, rows as i32 - 1);
+    (new_row as usize * cols + new_col as usize).min(n - 1)
+}
+
 /// Largest rect with `size`'s aspect ratio that fits centered inside `container`.
 fn fit_centered(container: egui::Rect, size: egui::Vec2) -> egui::Rect {
     if size.x <= 0.0 || size.y <= 0.0 {
@@ -633,8 +651,39 @@ impl eframe::App for App {
             self.open(&ctx, path);
         }
 
-        // A frame clicked this pass: its clip time, to start playback there.
+        // A frame clicked (or picked with Enter) this pass: its clip time, to
+        // start playback there.
         let mut play_from: Option<f64> = None;
+        // Set when AWSD moved the cursor this pass, so we only auto-scroll then
+        // and don't fight the user's mouse-wheel scrolling.
+        let mut cursor_moved = false;
+
+        // AWSD moves the frame cursor; Enter plays the frame under it.
+        if let Some(l) = &mut self.loaded {
+            let (left, right, up, down, enter) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::A),
+                    i.key_pressed(egui::Key::D),
+                    i.key_pressed(egui::Key::W),
+                    i.key_pressed(egui::Key::S),
+                    i.key_pressed(egui::Key::Enter),
+                )
+            });
+            let n = l.cells.len();
+            if n > 0 {
+                let dx = right as i32 - left as i32;
+                let dy = down as i32 - up as i32;
+                if dx != 0 || dy != 0 {
+                    l.cursor = move_cursor(l.cursor, n, GRID_COLS, dx, dy);
+                    cursor_moved = true;
+                }
+                if enter {
+                    if let Some(Cell::Ready { time_s, .. }) = l.cells.get(l.cursor) {
+                        play_from = Some(*time_s);
+                    }
+                }
+            }
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.error {
@@ -660,7 +709,7 @@ impl eframe::App for App {
                     .spacing([spacing, spacing])
                     .show(ui, |ui| {
                         for (i, cell) in l.cells.iter().enumerate() {
-                            match cell {
+                            let cell_rect = match cell {
                                 Cell::Ready { tex, time_s } => {
                                     let sized = egui::load::SizedTexture::new(tex.id(), size);
                                     let resp = ui.add(
@@ -670,11 +719,26 @@ impl eframe::App for App {
                                     if resp.clicked() {
                                         play_from = Some(*time_s);
                                     }
+                                    resp.rect
                                 }
                                 Cell::Pending => {
                                     let (rect, _) =
                                         ui.allocate_exact_size(size, egui::Sense::hover());
                                     ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(35));
+                                    rect
+                                }
+                            };
+                            if i == l.cursor {
+                                ui.painter().rect_stroke(
+                                    cell_rect,
+                                    2.0,
+                                    egui::Stroke::new(3.0, egui::Color32::from_rgb(77, 166, 255)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                if cursor_moved {
+                                    // Keep the selected cell visible as it moves
+                                    // through the scrolled grid.
+                                    ui.scroll_to_rect(cell_rect, None);
                                 }
                             }
                             if (i + 1) % cols == 0 {
@@ -716,6 +780,25 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["a.mov", "b.mp4"]);
+    }
+
+    #[test]
+    fn cursor_moves_and_clamps_at_edges() {
+        // 4-wide grid, 10 cells (last row is 8,9 — partial).
+        let cols = 4;
+        let n = 10;
+        // From top-left: left/up clamp in place, right/down step.
+        assert_eq!(move_cursor(0, n, cols, -1, 0), 0); // left edge
+        assert_eq!(move_cursor(0, n, cols, 0, -1), 0); // top edge
+        assert_eq!(move_cursor(0, n, cols, 1, 0), 1); // right
+        assert_eq!(move_cursor(0, n, cols, 0, 1), 4); // down a row
+        // Right edge of a full row clamps horizontally.
+        assert_eq!(move_cursor(3, n, cols, 1, 0), 3);
+        // Down into the partial last row snaps back to the last cell.
+        assert_eq!(move_cursor(6, n, cols, 0, 1), 9); // col 2 row 2 -> would be 10, clamped to 9
+        assert_eq!(move_cursor(7, n, cols, 0, 1), 9); // col 3 row 2 -> would be 11, clamped to 9
+        // An empty grid stays put.
+        assert_eq!(move_cursor(0, 0, cols, 1, 1), 0);
     }
 
     #[test]
