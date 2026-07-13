@@ -1,6 +1,6 @@
 # 0006. Distribute to the tester via GitHub Release self-update
 
-- Status: Accepted
+- Status: Superseded by ADR-0007
 - Date: 2026-07-13
 
 ## Context
