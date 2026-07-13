@@ -17,6 +17,10 @@ const THUMB_SPACING_S: f64 = 1.0;
 const THUMB_LONG: u32 = 320;
 const GRID_COLS: usize = 4;
 
+/// Long side of decoded playback frames. Caps per-frame scaling and texture
+/// upload cost; large enough for the video to fill a typical window crisply.
+const PLAYBACK_LONG: u32 = 1600;
+
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 
@@ -81,10 +85,42 @@ enum Msg {
     Err(String),
 }
 
-/// One grid cell: waiting to be decoded, or an uploaded texture.
+/// One grid cell: waiting to be decoded, or an uploaded texture together with
+/// the clip time it was sampled at (used to start playback there).
 enum Cell {
     Pending,
-    Ready(egui::TextureHandle),
+    Ready {
+        tex: egui::TextureHandle,
+        time_s: f64,
+    },
+}
+
+/// Messages from the playback decode thread to the UI.
+enum PlayMsg {
+    Frame(media::PlaybackFrame),
+    Err(String),
+}
+
+/// Active playback of the loaded clip, filling the window. Frames arrive over a
+/// bounded channel (backpressure paces the decoder to real time); the UI shows
+/// each one when its presentation time is due against the egui wall clock.
+struct Player {
+    rx: Receiver<PlayMsg>,
+    tex: Option<egui::TextureHandle>,
+    frame_size: egui::Vec2,
+    /// egui time when the playback clock was last anchored.
+    anchor_time: f64,
+    /// Media time of the frame shown at `anchor_time`.
+    anchor_media_s: f64,
+    /// False until the first frame arrives and anchors the clock.
+    started: bool,
+    /// A frame pulled from the channel but not yet due for display.
+    pending: Option<media::PlaybackFrame>,
+    paused: bool,
+    /// egui time when paused, to shift the anchor forward on resume.
+    pause_time: f64,
+    /// The decoder reached end-of-stream; drain what's left, then return to grid.
+    ended: bool,
 }
 
 /// A clip being (or already) loaded.
@@ -102,6 +138,8 @@ struct Loaded {
 struct App {
     pending_open: Option<PathBuf>,
     loaded: Option<Loaded>,
+    /// Some while a clip is playing back over the grid.
+    player: Option<Player>,
     error: Option<String>,
 }
 
@@ -122,6 +160,8 @@ impl App {
     /// Kick off background extraction; returns immediately.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.error = None;
+        // Leaving any current clip: stop playback and fall back to the grid.
+        self.player = None;
 
         let (tx, rx) = mpsc::channel();
         let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
@@ -184,7 +224,10 @@ impl App {
                         if i >= l.cells.len() {
                             l.cells.resize_with(i + 1, || Cell::Pending);
                         }
-                        l.cells[i] = Cell::Ready(tex);
+                        l.cells[i] = Cell::Ready {
+                            tex,
+                            time_s: t.time_s,
+                        };
                         l.ready += 1;
                     }
                     Ok(Msg::Done) => l.done = true,
@@ -202,6 +245,163 @@ impl App {
             self.loaded = None;
         }
     }
+
+    /// Start playing the loaded clip from the keyframe before `start_from_s`.
+    /// Spawns a decode thread that streams frames back over a bounded channel;
+    /// the full-resolution decode lives in `media`, timing lives here.
+    fn play(&mut self, ctx: &egui::Context, start_from_s: f64) {
+        let Some(l) = &self.loaded else { return };
+        let path = l.path.clone();
+
+        // Small bound: the decoder blocks on a full channel, which paces it to
+        // real time and lets pause "just work" (the UI stops draining).
+        let (tx, rx) = mpsc::sync_channel::<PlayMsg>(3);
+        let ctx_frame = ctx.clone();
+        thread::spawn(move || {
+            let result = media::play_stream(&path, start_from_s, PLAYBACK_LONG, |f| {
+                let delivered = tx.send(PlayMsg::Frame(f)).is_ok();
+                ctx_frame.request_repaint();
+                delivered
+            });
+            if let Err(e) = result {
+                let _ = tx.send(PlayMsg::Err(format!("{e:#}")));
+                ctx_frame.request_repaint();
+            }
+        });
+
+        self.player = Some(Player {
+            rx,
+            tex: None,
+            frame_size: egui::Vec2::ZERO,
+            anchor_time: 0.0,
+            anchor_media_s: 0.0,
+            started: false,
+            pending: None,
+            paused: false,
+            pause_time: 0.0,
+            ended: false,
+        });
+    }
+
+    /// Present frames that have come due against the wall clock. Returns `false`
+    /// when playback is over (end-of-stream drained, or a decode error), so the
+    /// caller drops the player and returns to the grid.
+    fn advance_player(&mut self, ctx: &egui::Context) -> bool {
+        let now = ctx.input(|i| i.time);
+        let Some(p) = &mut self.player else { return true };
+        if p.paused {
+            return true;
+        }
+        loop {
+            if p.pending.is_none() {
+                match p.rx.try_recv() {
+                    Ok(PlayMsg::Frame(f)) => p.pending = Some(f),
+                    Ok(PlayMsg::Err(e)) => {
+                        self.error = Some(e);
+                        return false;
+                    }
+                    Err(TryRecvError::Empty) => break, // decode not keeping up; wait
+                    Err(TryRecvError::Disconnected) => {
+                        p.ended = true;
+                        break;
+                    }
+                }
+            }
+            let f = p.pending.as_ref().unwrap();
+            if !p.started {
+                p.started = true;
+                p.anchor_time = now;
+                p.anchor_media_s = f.time_s;
+            }
+            let target = p.anchor_media_s + (now - p.anchor_time);
+            if f.time_s <= target {
+                let f = p.pending.take().unwrap();
+                p.frame_size = egui::vec2(f.width as f32, f.height as f32);
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [f.width as usize, f.height as usize],
+                    &f.rgba,
+                );
+                match &mut p.tex {
+                    Some(tex) => tex.set(img, egui::TextureOptions::default()),
+                    None => p.tex = Some(ctx.load_texture("playback", img, egui::TextureOptions::default())),
+                }
+            } else {
+                break; // not due yet
+            }
+        }
+        // End once the last decoded frame has been shown.
+        !(p.ended && p.pending.is_none())
+    }
+
+    /// Space toggles pause; on resume the clock anchor slides forward by the
+    /// paused span so timing stays continuous.
+    fn toggle_pause(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if let Some(p) = &mut self.player {
+            if p.paused {
+                p.anchor_time += now - p.pause_time;
+                p.paused = false;
+            } else {
+                p.paused = true;
+                p.pause_time = now;
+            }
+        }
+    }
+
+    /// Draw the playing clip filling the window and handle its keys. Returns to
+    /// the grid on a click, on Escape, on end-of-stream, or on a decode error.
+    /// Space pauses.
+    fn playback_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Escape leaves playback and returns to the grid without quitting.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.player = None;
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.toggle_pause(ctx);
+        }
+        if !self.advance_player(ctx) {
+            self.player = None;
+            return;
+        }
+
+        // Keep the clock ticking while playing; a paused frame is static.
+        let paused = self.player.as_ref().is_some_and(|p| p.paused);
+        if !paused {
+            ctx.request_repaint();
+        }
+
+        // Full-window black backdrop with the frame letterboxed into it. A click
+        // anywhere returns to the grid.
+        let clicked = egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                let resp = ui.interact(rect, ui.id().with("playback"), egui::Sense::click());
+                if let Some(p) = &self.player {
+                    if let Some(tex) = &p.tex {
+                        let target = fit_centered(rect, p.frame_size);
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        ui.painter().image(tex.id(), target, uv, egui::Color32::WHITE);
+                    }
+                }
+                resp.clicked()
+            })
+            .inner;
+        if clicked {
+            self.player = None;
+        }
+    }
+}
+
+/// Largest rect with `size`'s aspect ratio that fits centered inside `container`.
+fn fit_centered(container: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return container;
+    }
+    let scale = (container.width() / size.x).min(container.height() / size.y);
+    egui::Rect::from_center_size(container.center(), size * scale)
 }
 
 impl eframe::App for App {
@@ -220,6 +420,13 @@ impl eframe::App for App {
         }
 
         self.poll(&ctx);
+
+        // While a clip is playing it fills the window; the grid and its keys are
+        // hidden until playback ends or Escape returns here.
+        if self.player.is_some() {
+            self.playback_ui(ui, &ctx);
+            return;
+        }
 
         // ESC quits.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -280,6 +487,9 @@ impl eframe::App for App {
             self.open(&ctx, path);
         }
 
+        // A frame clicked this pass: its clip time, to start playback there.
+        let mut play_from: Option<f64> = None;
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(egui::Color32::RED, err);
@@ -305,9 +515,15 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         for (i, cell) in l.cells.iter().enumerate() {
                             match cell {
-                                Cell::Ready(tex) => {
+                                Cell::Ready { tex, time_s } => {
                                     let sized = egui::load::SizedTexture::new(tex.id(), size);
-                                    ui.add(egui::Image::from_texture(sized));
+                                    let resp = ui.add(
+                                        egui::Image::from_texture(sized)
+                                            .sense(egui::Sense::click()),
+                                    );
+                                    if resp.clicked() {
+                                        play_from = Some(*time_s);
+                                    }
                                 }
                                 Cell::Pending => {
                                     let (rect, _) =
@@ -322,6 +538,11 @@ impl eframe::App for App {
                     });
             });
         });
+
+        // Start playback after the panel closure releases its borrow of `self`.
+        if let Some(t) = play_from {
+            self.play(&ctx, t);
+        }
     }
 }
 
