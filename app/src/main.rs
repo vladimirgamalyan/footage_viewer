@@ -758,7 +758,7 @@ impl eframe::App for App {
         }
 
         if let Some(l) = &self.loaded {
-            egui::Panel::top("bar").show(ui, |ui| {
+            egui::Panel::bottom("status").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let name = l
                         .path
