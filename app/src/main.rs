@@ -15,7 +15,12 @@ use footage_viewer_media as media;
 
 const THUMB_SPACING_S: f64 = 1.0;
 const THUMB_LONG: u32 = 320;
-const GRID_COLS: usize = 4;
+
+/// Grid column count: the value the app starts at and the inclusive range the
+/// `-`/`+` keys clamp it to.
+const GRID_COLS_DEFAULT: usize = 4;
+const GRID_COLS_MIN: usize = 1;
+const GRID_COLS_MAX: usize = 12;
 
 /// Long side of decoded playback frames. Caps per-frame scaling and texture
 /// upload cost; large enough for the video to fill a typical window crisply.
@@ -177,6 +182,9 @@ struct App {
     seek_dir: i32,
     seek_next_fire: f64,
     seek_target: f64,
+    /// How many columns the frame grid shows; changed with the `-`/`+` keys and
+    /// kept across clips. Clamped to [`GRID_COLS_MIN`]..=[`GRID_COLS_MAX`].
+    grid_cols: usize,
     error: Option<String>,
 }
 
@@ -184,6 +192,7 @@ impl App {
     fn new(pending: Option<PathBuf>) -> Self {
         Self {
             pending_open: pending,
+            grid_cols: GRID_COLS_DEFAULT,
             ..Default::default()
         }
     }
@@ -725,6 +734,25 @@ impl eframe::App for App {
             return;
         }
 
+        // -/+ change how many columns the grid shows, trading thumbnail size for
+        // how many frames fit on screen. Accept "=" as "+" too, since on most
+        // layouts "+" is Shift+"=". The cursor is an absolute cell index, so it
+        // stays valid across a column change with no fix-up needed.
+        if self.loaded.is_some() {
+            let (shrink, grow) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Minus),
+                    i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                )
+            });
+            if shrink {
+                self.grid_cols = self.grid_cols.saturating_sub(1).max(GRID_COLS_MIN);
+            }
+            if grow {
+                self.grid_cols = (self.grid_cols + 1).min(GRID_COLS_MAX);
+            }
+        }
+
         // A clip to open this frame, from a button, an arrow key, or the dialog.
         let mut nav_to: Option<PathBuf> = None;
         if self.loaded.is_some() {
@@ -773,6 +801,7 @@ impl eframe::App for App {
         let mut cursor_moved = false;
 
         // AWSD moves the frame cursor; Enter plays the frame under it; "I" saves it.
+        let grid_cols = self.grid_cols;
         if let Some(l) = &mut self.loaded {
             let (left, right, up, down, enter, save) = ctx.input(|i| {
                 (
@@ -789,7 +818,7 @@ impl eframe::App for App {
                 let dx = right as i32 - left as i32;
                 let dy = down as i32 - up as i32;
                 if dx != 0 || dy != 0 {
-                    l.cursor = move_cursor(l.cursor, n, GRID_COLS, dx, dy);
+                    l.cursor = move_cursor(l.cursor, n, grid_cols, dx, dy);
                     cursor_moved = true;
                 }
                 if let Some(Cell::Ready { time_s, .. }) = l.cells.get(l.cursor) {
@@ -815,7 +844,7 @@ impl eframe::App for App {
                 return;
             };
 
-            let cols = GRID_COLS;
+            let cols = self.grid_cols;
             let spacing = 6.0f32;
             let avail = ui.available_width();
             let cell_w = ((avail - spacing * (cols as f32 + 1.0)) / cols as f32).max(80.0);
