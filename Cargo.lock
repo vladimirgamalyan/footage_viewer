@@ -1186,11 +1186,12 @@ dependencies = [
  "anyhow",
  "ffmpeg-next",
  "image",
+ "log",
 ]
 
 [[package]]
 name = "footage_viewer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "footage-viewer-media",

@@ -33,6 +33,18 @@ const SEEK_BACK_US: i64 = 1_000;
 /// target counts as "the frame at the target", absorbing PTS rounding.
 const FRAME_EPS_S: f64 = 1e-3;
 
+/// A forward scrub (Scrub/Play) whose target is within this many seconds ahead of
+/// the current decoded position decodes forward in place instead of seeking back
+/// to a keyframe and re-decoding the GOP. Beyond it a keyframe seek reaches the
+/// target with fewer decodes, so we fall back to that. Sized to cover A/D's
+/// half-second steps and small drags while never decoding across more than a
+/// short gap.
+const FORWARD_SCRUB_LIMIT_S: f64 = 2.0;
+
+/// Log a one-line timing breakdown for each live seek (Scrub/Play), to diagnose
+/// scrub latency on a tester's footage. Flip to `false` to silence it.
+const LOG_SCRUB_TIMING: bool = true;
+
 /// Cap on frame-decoding threads for playback. Frame threading delays the first
 /// output by roughly the thread count: the pipeline must fill before frame 0 is
 /// released, so the all-cores default (e.g. 32) buffers ~18 frames before the
@@ -91,22 +103,20 @@ struct PlayState {
     /// A seek to apply before decoding resumes: `(time_s, precise)`. `precise`
     /// skips forward to the exact frame; otherwise playback opens at the keyframe.
     pending_seek: Option<(f64, bool)>,
+    /// Media time of the most recently decoded frame, so a forward scrub can tell
+    /// how far ahead its target is and skip in place rather than re-seek.
+    current_s: f64,
+    /// When the in-flight Scrub/Play began; the decode loop takes it to time that
+    /// move's landing latency (see [`LOG_SCRUB_TIMING`]).
+    move_start: Option<Instant>,
 }
 
 impl PlayState {
     /// Fold a command into the state. Returns `false` on `Stop` (end playback).
     fn apply(&mut self, cmd: PlayCommand) -> bool {
         match cmd {
-            PlayCommand::Scrub(t) => {
-                self.pending_seek = Some((t, true));
-                self.hold_after = true;
-                self.paused = false;
-            }
-            PlayCommand::Play(t) => {
-                self.pending_seek = Some((t, true));
-                self.hold_after = false;
-                self.paused = false;
-            }
+            PlayCommand::Scrub(t) => self.start_move(t, true),
+            PlayCommand::Play(t) => self.start_move(t, false),
             PlayCommand::Pause => self.paused = true,
             PlayCommand::Resume => {
                 self.paused = false;
@@ -116,6 +126,35 @@ impl PlayState {
         }
         true
     }
+
+    /// Begin a precise move to `t`, holding on the landed frame when `hold`. A
+    /// short hop forward of the current position decodes forward in place (no
+    /// seek/flush), so we don't re-decode the GOP behind us; anything else seeks
+    /// to the keyframe before the target. Resets the pacing anchor either way so
+    /// the hop isn't paced out in real time.
+    fn start_move(&mut self, t: f64, hold: bool) {
+        if t >= self.current_s && t - self.current_s <= FORWARD_SCRUB_LIMIT_S {
+            self.skip_until = Some(t);
+        } else {
+            self.pending_seek = Some((t, true));
+        }
+        self.hold_after = hold;
+        self.paused = false;
+        self.anchor = None;
+        self.move_start = Some(Instant::now());
+    }
+}
+
+/// Timing for one live seek, accumulated across the decode loop and logged when
+/// the landing frame is emitted (see [`LOG_SCRUB_TIMING`]). Separates the two
+/// costs that make scrubbing slow: the keyframe seek/flush, and the number of
+/// frames decoded forward to reach the exact target.
+struct SeekProfile {
+    start: Instant,
+    target_s: f64,
+    seek_ms: f64,
+    decoded: u32,
+    decode_ms: f64,
 }
 
 /// Clip metadata, reported once before any thumbnail.
@@ -405,6 +444,8 @@ pub fn play_stream(
         anchor: None,
         // Initial start: keyframe-before, matching a grid-cell click.
         pending_seek: Some((start_from_s, false)),
+        current_s: start_from_s,
+        move_start: None,
     };
     // Demux/decoder end-of-stream flags, reset on every seek.
     let mut demux_eof = false;
@@ -412,14 +453,38 @@ pub fn play_stream(
     // Most recent frame skipped while precise-seeking; emitted if the seek target
     // lies past the last frame, so stepping/scrubbing to the end lands on it.
     let mut last_skipped: Option<Video> = None;
+    // Timing for the in-flight live seek, logged when its frame lands.
+    let mut profile: Option<SeekProfile> = None;
 
     loop {
+        // A precise move (Scrub/Play) just started: open a timing profile for it,
+        // whether it will seek to a keyframe or hop forward in place.
+        if let Some(start) = st.move_start.take() {
+            if LOG_SCRUB_TIMING {
+                let target_s = st
+                    .skip_until
+                    .or(st.pending_seek.map(|(t, _)| t))
+                    .unwrap_or(st.current_s);
+                profile = Some(SeekProfile {
+                    start,
+                    target_s,
+                    seek_ms: 0.0,
+                    decoded: 0,
+                    decode_ms: 0.0,
+                });
+            }
+        }
+
         // Apply a pending seek: land on the keyframe at or before (target − ε) and
         // flush, so the decoder resumes cleanly from the new position.
         if let Some((t, precise)) = st.pending_seek.take() {
+            let seek_start = Instant::now();
             let target_us = (((t + start_s) * AV_TIME_BASE) as i64 - SEEK_BACK_US).max(0);
             ictx.seek(target_us, ..target_us)?;
             decoder.flush();
+            if let Some(p) = &mut profile {
+                p.seek_ms = millis(seek_start.elapsed());
+            }
             st.skip_until = precise.then_some(t);
             st.anchor = None;
             demux_eof = false;
@@ -453,13 +518,21 @@ pub fn play_stream(
         }
 
         // Decode the next frame.
-        let frame = match next_frame(
+        let decode_start = Instant::now();
+        let decoded = next_frame(
             &mut ictx,
             &mut decoder,
             stream_index,
             &mut demux_eof,
             &mut eof_sent,
-        )? {
+        )?;
+        if let Some(p) = &mut profile {
+            p.decode_ms += millis(decode_start.elapsed());
+            if decoded.is_some() {
+                p.decoded += 1;
+            }
+        }
+        let frame = match decoded {
             Some(f) => f,
             None => match last_skipped.take() {
                 // End of stream while still skipping toward a precise seek target
@@ -482,6 +555,7 @@ pub fn play_stream(
             },
         };
         let time_s = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
+        st.current_s = time_s;
 
         // Skip decoded frames before a precise seek target so scrubbing lands on
         // the exact frame rather than the keyframe. Buffer the last skipped frame
@@ -530,6 +604,25 @@ pub fn play_stream(
             rgba: t.rgba,
         }) {
             return Ok(());
+        }
+        // A live seek's frame just landed: log its timing breakdown and close the
+        // profile so later frames of a forward Play aren't logged.
+        if let Some(p) = profile.take() {
+            let per = if p.decoded > 0 {
+                p.decode_ms / p.decoded as f64
+            } else {
+                0.0
+            };
+            log::info!(
+                "scrub -> {:.3}s | total {:.1}ms | seek {:.1}ms | decoded {} frames {:.1}ms ({:.1}ms/f) | landed {:.3}s",
+                p.target_s,
+                millis(p.start.elapsed()),
+                p.seek_ms,
+                p.decoded,
+                p.decode_ms,
+                per,
+                time_s,
+            );
         }
         // Scrub shows one frame at the target, then holds on it.
         if st.hold_after {
@@ -656,6 +749,11 @@ fn next_frame(
     }
 }
 
+/// A `Duration` as fractional milliseconds, for timing logs.
+fn millis(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
 /// Fit into a box whose long side is `long`, preserving aspect, even dimensions.
 fn thumb_size(w: u32, h: u32, long: u32) -> (u32, u32) {
     let (mut ow, mut oh) = if w >= h {
@@ -740,6 +838,42 @@ mod tests {
         worker.join().unwrap().unwrap();
 
         assert!(landed.is_some(), "scrub did not land near 12s: {landed:?}");
+    }
+
+    /// Two short forward scrubs each land on the exact target frame. These stay
+    /// within `FORWARD_SCRUB_LIMIT_S`, so they take the in-place forward-decode
+    /// path (no re-seek) — the second hop decodes on from where the first landed.
+    #[test]
+    fn short_forward_scrubs_land_on_target() {
+        init().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel::<f64>();
+        let path = test_video("counter_25s_vertical.mp4");
+
+        let worker = std::thread::spawn(move || {
+            play_stream(&path, 0.0, 320, cmd_rx, |f| frame_tx.send(f.time_s).is_ok())
+        });
+
+        // Wait for the first frame so the decoder is warm and near t=0, keeping
+        // the following scrubs short hops forward rather than backward seeks.
+        frame_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no first frame");
+
+        for target in [0.6_f64, 1.1] {
+            cmd_tx.send(PlayCommand::Scrub(target)).unwrap();
+            let mut landed = None;
+            while let Ok(t) = frame_rx.recv_timeout(Duration::from_secs(10)) {
+                if (t - target).abs() < 0.06 {
+                    landed = Some(t);
+                    break;
+                }
+            }
+            assert!(landed.is_some(), "forward scrub did not land near {target}s");
+        }
+
+        cmd_tx.send(PlayCommand::Stop).unwrap();
+        worker.join().unwrap().unwrap();
     }
 
     /// `save_frame_jpeg` writes a valid JPEG at full source resolution for the
