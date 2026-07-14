@@ -1194,6 +1194,7 @@ version = "0.3.1"
 dependencies = [
  "eframe",
  "footage-viewer-media",
+ "log",
  "tempfile",
  "trash",
  "winresource",

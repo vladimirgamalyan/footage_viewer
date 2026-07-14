@@ -7,6 +7,9 @@ edition = "2021"
 footage-viewer-media = { path = "../media" }
 eframe = "0.35"
 trash = "5.2.6"
+# Logging facade; also captures eframe/wgpu diagnostics. Already in the tree via
+# eframe, declared here so the app can log directly. See src/logging.rs.
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

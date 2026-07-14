@@ -13,6 +13,8 @@ use std::thread;
 use eframe::egui;
 use footage_viewer_media as media;
 
+mod logging;
+
 const THUMB_SPACING_S: f64 = 1.0;
 const THUMB_LONG: u32 = 320;
 
@@ -89,9 +91,21 @@ fn neighbor_of(current: &Path, delta: i32) -> Option<PathBuf> {
 }
 
 fn main() -> eframe::Result<()> {
+    let log_path = logging::init();
+    log::info!(
+        "footage_viewer {} starting on {} ({}); log: {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        log_path.display()
+    );
+
     media::init().expect("failed to initialize ffmpeg");
 
     let pending = std::env::args().nth(1).map(PathBuf::from);
+    if let Some(p) = &pending {
+        log::info!("initial clip from command line: {}", p.display());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("footage_viewer")
@@ -102,11 +116,16 @@ fn main() -> eframe::Result<()> {
             ),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "footage_viewer",
         options,
         Box::new(|_cc| Ok(Box::new(App::new(pending)))),
-    )
+    );
+    match &result {
+        Ok(()) => log::info!("exiting normally"),
+        Err(e) => log::error!("eframe exited with error: {e}"),
+    }
+    result
 }
 
 /// Messages from the extraction worker to the UI.
@@ -205,6 +224,7 @@ impl App {
 
     /// Kick off background extraction; returns immediately.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        log::info!("opening clip: {}", path.display());
         self.error = None;
         // Leaving any current clip: stop playback and fall back to the grid.
         self.player = None;
@@ -303,6 +323,8 @@ impl App {
             }
         }
         if let Some(e) = failed {
+            let clip = self.loaded.as_ref().map(|l| l.path.display().to_string());
+            log::error!("extraction failed for {}: {e}", clip.as_deref().unwrap_or("?"));
             self.error = Some(e);
             self.loaded = None;
         }
@@ -362,6 +384,7 @@ impl App {
             match p.rx.try_recv() {
                 Ok(PlayMsg::Frame(f)) => latest = Some(f),
                 Ok(PlayMsg::Err(e)) => {
+                    log::error!("playback error: {e}");
                     self.error = Some(e);
                     return false;
                 }
@@ -410,7 +433,10 @@ impl App {
         let Some(l) = &self.loaded else { return };
         let out = l.path.with_extension("jpg");
         if let Err(e) = media::save_frame_jpeg(&l.path, time_s, &out, STILL_JPEG_QUALITY) {
+            log::error!("failed to save still {} at {time_s:.3}s: {e:#}", out.display());
             self.error = Some(format!("Failed to save still: {e:#}"));
+        } else {
+            log::info!("saved still {}", out.display());
         }
     }
 
@@ -425,13 +451,16 @@ impl App {
         // Resolve the neighbor before deleting, while the clip still lists.
         let target = self.neighbor(1).or_else(|| self.neighbor(-1));
         if let Err(e) = trash::delete(&path) {
+            log::error!("failed to delete {}: {e}", path.display());
             self.error = Some(format!("Failed to delete {}: {e}", path.display()));
             return None;
         }
+        log::info!("deleted clip {}", path.display());
         // Also bin the sidecar still saved by save_still (`<clip-stem>.jpg`), if any.
         let still = path.with_extension("jpg");
         if still.exists() {
             if let Err(e) = trash::delete(&still) {
+                log::error!("failed to delete sidecar {}: {e}", still.display());
                 self.error = Some(format!("Failed to delete {}: {e}", still.display()));
             }
         }

@@ -3,3 +3,9 @@ resolver = "2"
 members = ["app", "media"]
 # vendor holds the FFmpeg binary build; spike is standalone throwaway validation.
 exclude = ["vendor", "spike"]
+
+# Keep line-table debuginfo in release so panic backtraces in the tester's log
+# (see docs/adr/0008) carry function names and source lines, not bare addresses.
+# Line tables only — the size cost is modest and no full variable debuginfo.
+[profile.release]
+debug = "line-tables-only"
