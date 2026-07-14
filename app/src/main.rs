@@ -741,25 +741,9 @@ impl eframe::App for App {
             }
         }
 
-        egui::Panel::top("bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open video…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Video", VIDEO_EXTS)
-                        .pick_file()
-                    {
-                        nav_to = Some(path);
-                    }
-                }
-                if let Some(l) = &self.loaded {
-                    ui.separator();
-                    if ui.button("◀ Prev").clicked() {
-                        nav_to = self.neighbor(-1);
-                    }
-                    if ui.button("Next ▶").clicked() {
-                        nav_to = self.neighbor(1);
-                    }
-                    ui.separator();
+        if let Some(l) = &self.loaded {
+            egui::Panel::top("bar").show(ui, |ui| {
+                ui.horizontal(|ui| {
                     let name = l
                         .path
                         .file_name()
@@ -771,9 +755,9 @@ impl eframe::App for App {
                         ui.add(egui::Spinner::new());
                         ui.label(format!("{} frames", l.ready));
                     }
-                }
+                });
             });
-        });
+        }
 
         if let Some(path) = nav_to {
             self.open(&ctx, path);
