@@ -170,9 +170,6 @@ struct App {
     loaded: Option<Loaded>,
     /// Some while a clip is playing back over the grid.
     player: Option<Player>,
-    /// Media time to resume playback from when toggling back into the player
-    /// with Tab. Set when leaving playback for the grid; reset when a clip opens.
-    resume_from_s: f64,
     /// egui time of the last live seek fired while dragging the scrubber, for
     /// throttling (see [`SCRUB_INTERVAL_S`]).
     scrub_last_seek: f64,
@@ -206,10 +203,8 @@ impl App {
     /// Kick off background extraction; returns immediately.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.error = None;
-        // Leaving any current clip: stop playback, fall back to the grid, and
-        // reset the Tab-resume position to the start of the new clip.
+        // Leaving any current clip: stop playback and fall back to the grid.
         self.player = None;
-        self.resume_from_s = 0.0;
 
         let (tx, rx) = mpsc::channel();
         let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
@@ -419,22 +414,17 @@ impl App {
             // Deleted the only clip in the folder — nothing left to show.
             self.player = None;
             self.loaded = None;
-            self.resume_from_s = 0.0;
         }
         target
     }
 
-    /// Leave playback for the grid, remembering the current position so Tab can
-    /// resume there. A no-op when nothing is playing.
+    /// Leave playback and fall back to the grid. A no-op when nothing is playing.
     fn stop_playback(&mut self) {
-        if let Some(p) = &self.player {
-            self.resume_from_s = p.position_s;
-        }
         self.player = None;
     }
 
     /// Draw the playing clip filling the window and handle its keys. A click in
-    /// the video area, Tab, or a decode error returns to the grid; Escape closes
+    /// the video area, Enter, or a decode error returns to the grid; Escape closes
     /// the app. A scrubber along the bottom shows the position and seeks on drag or
     /// click. Left/Right play the previous/next sibling clip from its start,
     /// staying in playback; Space pauses; A/D nudge the position back/forward
@@ -472,9 +462,9 @@ impl App {
             return;
         }
 
-        // Tab returns to the grid, remembering the position so Tab there resumes
-        // here. Consume it so egui doesn't also use it for focus navigation.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+        // Enter returns to the grid. Consume it so egui doesn't also use it to
+        // activate a focused widget.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             self.stop_playback();
             return;
         }
@@ -709,15 +699,6 @@ impl eframe::App for App {
         // hidden until playback ends or Escape returns here.
         if self.player.is_some() {
             self.playback_ui(ui, &ctx);
-            return;
-        }
-
-        // Tab (with a clip loaded) switches to the player, resuming where
-        // playback last left off. Consume it so egui doesn't move widget focus.
-        if self.loaded.is_some()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
-        {
-            self.play(&ctx, self.resume_from_s);
             return;
         }
 
