@@ -820,7 +820,8 @@ impl eframe::App for App {
             }
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        let grid_frame = egui::Frame::NONE.fill(ui.visuals().panel_fill);
+        egui::CentralPanel::default().frame(grid_frame).show(ui, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(egui::Color32::RED, err);
                 return;
@@ -833,7 +834,7 @@ impl eframe::App for App {
             };
 
             let cols = self.grid_cols;
-            let spacing = 6.0f32;
+            let spacing = 2.0f32;
             let avail = ui.available_width();
             let cell_w = ((avail - spacing * (cols as f32 + 1.0)) / cols as f32).max(80.0);
             let cell_h = cell_w * l.aspect;
@@ -866,7 +867,7 @@ impl eframe::App for App {
                             if i == l.cursor {
                                 ui.painter().rect_stroke(
                                     cell_rect,
-                                    2.0,
+                                    0.0,
                                     egui::Stroke::new(3.0, egui::Color32::from_rgb(77, 166, 255)),
                                     egui::StrokeKind::Inside,
                                 );
