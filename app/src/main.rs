@@ -183,6 +183,9 @@ struct App {
     /// kept across clips. Clamped to [`GRID_COLS_MIN`]..=[`GRID_COLS_MAX`].
     grid_cols: usize,
     error: Option<String>,
+    /// The clip path currently reflected in the window title, so the title is
+    /// only updated when the loaded clip actually changes.
+    title_path: Option<PathBuf>,
 }
 
 impl App {
@@ -242,6 +245,21 @@ impl App {
             rx,
             cursor: 0,
         });
+    }
+
+    /// Reflect the loaded clip's path in the window title, resending the command
+    /// only when the path changes rather than every frame.
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        let path = self.loaded.as_ref().map(|l| l.path.clone());
+        if path == self.title_path {
+            return;
+        }
+        let title = match &path {
+            Some(p) => format!("{} — footage_viewer", p.display()),
+            None => "footage_viewer".to_owned(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        self.title_path = path;
     }
 
     /// Drain whatever the worker has produced since the last frame.
@@ -701,6 +719,7 @@ impl eframe::App for App {
         }
 
         self.poll(&ctx);
+        self.sync_title(&ctx);
 
         // While a clip is playing it fills the window; the grid and its keys are
         // hidden until playback ends or Escape returns here.
