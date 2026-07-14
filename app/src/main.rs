@@ -410,6 +410,13 @@ impl App {
             self.error = Some(format!("Failed to delete {}: {e}", path.display()));
             return None;
         }
+        // Also bin the sidecar still saved by save_still (`<clip-stem>.jpg`), if any.
+        let still = path.with_extension("jpg");
+        if still.exists() {
+            if let Err(e) = trash::delete(&still) {
+                self.error = Some(format!("Failed to delete {}: {e}", still.display()));
+            }
+        }
         if target.is_none() {
             // Deleted the only clip in the folder — nothing left to show.
             self.player = None;
