@@ -4,8 +4,8 @@ Synthetic clips for developing and testing the frame grid. Each is designed so
 that frames sampled evenly across time are **clearly distinct**, and each burns
 in a **timecode** so a grid cell can be verified against its true timestamp.
 
-All are H.264 / yuv420p / 30 fps, generated with the ffmpeg CLI — run
-`./generate.sh` (needs `ffmpeg` on PATH) to (re)create them.
+All are H.264 / yuv420p, generated with the ffmpeg CLI — run `./generate.sh`
+(needs `ffmpeg` on PATH) to (re)create them.
 
 | File | Res | Dur | What it exercises |
 |------|-----|-----|-------------------|
@@ -13,6 +13,10 @@ All are H.264 / yuv420p / 30 fps, generated with the ffmpeg CLI — run
 | `scenes_18s_720p.mp4` | 1280×720 | 18 s | 6 hard-cut scenes ×3 s (bars, rgb, testsrc2, fractal, life, gradient) — discrete scene changes. |
 | `mandelbrot_15s_1080p.mp4` | 1920×1080 | 15 s | Continuous fractal zoom + 1080p decode cost. |
 | `counter_25s_vertical.mp4` | 1080×1920 | 25 s | Vertical aspect + longer duration; testsrc counter for ground-truth times. |
+| `camera_8s_4k.mp4` | 3840×2160 | 8 s | 4K at 25 fps with a forced ~0.5 s GOP — stands in for the camera archive the tool targets. The only clip that takes the hardware decode path, and the only one whose seeks decode a short GOP. |
+
+The first four are 30 fps with x264's default 250-frame (~8 s) GOP; `camera_8s_4k.mp4`
+is 25 fps with `-g 12`, matching the target footage's ~0.5 s keyframe spacing.
 
 These are build artifacts, not source — regenerate with the script rather than
 committing them to version control.

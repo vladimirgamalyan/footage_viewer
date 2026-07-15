@@ -15,6 +15,11 @@ visually distinct thumbnails. See `ffmpeg_next/out/*_montage.png`.
 - `ffmpeg_next/` — the real spike: a Rust program using `ffmpeg-next` that
   reproduces the grid extraction in-process. `out/` holds per-clip thumbnails and
   a montage per clip.
+- `hwaccel/` — a **later, separate spike** (for **ADR-0009**, not ADR-0001): times
+  a precise seek on a D3D11VA decoder and splits the cost into seek, flush, decode
+  and GPU readback. It established that the flush, not the seek, was what made
+  scrubbing slow, and that the readback is only ~1.7 ms. Everything below in this
+  file concerns the ADR-0001 spike only.
 
 ## Environment (as tested, 2026-07-12)
 

@@ -1,0 +1,11 @@
+[package]
+name = "hwaccel_spike"
+version = "0.1.0"
+edition = "2021"
+
+# Spike: can a D3D11VA hardware decoder land precise seeks faster than the CPU
+# decode path, and is its flush cheap? De-risks moving playback to hwaccel.
+
+[dependencies]
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
+anyhow = "1"

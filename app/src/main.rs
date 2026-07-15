@@ -28,11 +28,6 @@ const GRID_COLS_MAX: usize = 12;
 /// upload cost; large enough for the video to fill a typical window crisply.
 const PLAYBACK_LONG: u32 = 1600;
 
-/// Minimum wall-clock gap between live seeks while dragging the scrubber. Each
-/// seek restarts the decoder, so throttling caps how many we fire during a drag
-/// while still tracking the cursor closely (~12/s).
-const SCRUB_INTERVAL_S: f64 = 0.08;
-
 /// Smallest cursor move (in media seconds) that triggers a new live seek while
 /// dragging. Holding within this of the current position keeps the frozen frame
 /// instead of restarting the decoder on the same spot.
@@ -189,9 +184,9 @@ struct App {
     loaded: Option<Loaded>,
     /// Some while a clip is playing back over the grid.
     player: Option<Player>,
-    /// egui time of the last live seek fired while dragging the scrubber, for
-    /// throttling (see [`SCRUB_INTERVAL_S`]).
-    scrub_last_seek: f64,
+    /// Set while a live seek fired from the scrubber has not produced its frame
+    /// yet, so a drag never has more than one seek in flight (see [`seek_bar_ui`]).
+    scrub_in_flight: bool,
     /// A/D seek key-repeat state in the player: sign of the held seek key
     /// (−1 A, +1 D, 0 none), the egui time the next repeat is due, and the
     /// running target so fast repeats accumulate even when frames lag behind.
@@ -396,6 +391,9 @@ impl App {
             }
         }
         if let Some(f) = latest {
+            // A frame arriving means any scrub we fired has landed: the decoder
+            // emits exactly one frame per `Scrub` and then holds on it.
+            self.scrub_in_flight = false;
             p.frame_size = egui::vec2(f.width as f32, f.height as f32);
             p.position_s = f.time_s;
             let img = egui::ColorImage::from_rgba_unmultiplied(
@@ -606,14 +604,7 @@ impl App {
 
                 let mut cmd = None;
                 if let Some(p) = &mut self.player {
-                    cmd = seek_bar_ui(
-                        ui,
-                        bar_rect,
-                        p,
-                        &mut self.scrub_last_seek,
-                        duration_s,
-                        now,
-                    );
+                    cmd = seek_bar_ui(ui, bar_rect, p, &mut self.scrub_in_flight, duration_s);
                 }
                 (resp.clicked(), cmd)
             })
@@ -634,15 +625,14 @@ impl App {
 /// decoder shows the exact frame at the cursor and holds); releasing resumes
 /// playback from that spot, or holds there if playback was paused. The handle
 /// just reflects the position. Returns the `PlayCommand` to send this frame — a
-/// held `Scrub` while dragging (throttled), or a `Play`/`Scrub` (per pause state)
-/// on click/release — else `None`.
+/// held `Scrub` while dragging, or a `Play`/`Scrub` (per pause state) on
+/// click/release — else `None`.
 fn seek_bar_ui(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     player: &mut Player,
-    last_seek: &mut f64,
+    in_flight: &mut bool,
     duration_s: f64,
-    now: f64,
 ) -> Option<media::PlayCommand> {
     let resp = ui.interact(rect, ui.id().with("seek"), egui::Sense::click_and_drag());
 
@@ -670,12 +660,16 @@ fn seek_bar_ui(
         if let Some(pos) = resp.interact_pointer_pos() {
             let target = time_at_x(pos.x);
             // Handle follows the cursor exactly. Fire a held live seek only once
-            // the cursor has moved off the shown frame, throttled so a fast drag
-            // doesn't flood the decoder with seeks.
+            // the cursor has moved off the shown frame, and only when the previous
+            // seek has landed: a drag outruns the decoder, and seeks fired on a
+            // fixed clock instead pile up in the command queue, each discarded by
+            // the next, so the picture stops tracking the cursor at all. Waiting
+            // for the landing paces us to the decoder — as fast as it can go, and
+            // never faster. The same gate paces the A/D keys in `playback_ui`.
             player.scrub = Some(target);
             let moved = (target - player.position_s).abs() >= SCRUB_MIN_STEP_S;
-            if moved && now - *last_seek >= SCRUB_INTERVAL_S {
-                *last_seek = now;
+            if moved && !*in_flight {
+                *in_flight = true;
                 cmd = Some(media::PlayCommand::Scrub(target));
             }
         }
