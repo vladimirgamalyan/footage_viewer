@@ -233,6 +233,11 @@ struct Loaded {
     cursor: usize,
     /// Stops the extraction worker; raised by `Drop`.
     cancel: Arc<AtomicBool>,
+    /// The extraction worker, which holds the clip's file open until it returns.
+    /// Joined by [`stop_extraction_and_wait`](App::stop_extraction_and_wait) when
+    /// the file itself must be free; `None` once taken, and for a grid that never
+    /// had a worker.
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for Loaded {
@@ -586,19 +591,30 @@ impl App {
     /// the folder is now empty. On a successful delete the binned clip's grid is
     /// dropped, so the caller can simply return to the empty view.
     ///
-    /// Playback always stops first, since the decoder has to release the file
-    /// before it can be binned. A caller that was playing therefore replays the
-    /// clip it is handed, and a delete that fails lands back on the grid with the
-    /// reason showing rather than silently carrying on playing.
-    fn delete_current(&mut self) -> Option<PathBuf> {
+    /// Both of the clip's readers stop first — playback, and a grid still being
+    /// extracted — since each holds the file open and Windows will not bin it
+    /// until they let go. A caller that was playing therefore replays the clip it
+    /// is handed rather than carrying on. A delete that fails lands back on the
+    /// grid with the reason showing, and an interrupted read is started again so
+    /// that grid is whole.
+    fn delete_current(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let path = self.loaded.as_ref()?.path.clone();
         // Resolve the neighbor before deleting, while the clip still lists.
         let target = self.neighbor(1).or_else(|| self.neighbor(-1));
-        // The clip cannot be binned while the decoder still has it open, and DEL
-        // is pressed from playback as often as from the grid.
+        // Nothing of ours may still hold the clip open, or Windows refuses to bin
+        // it. Both readers do: the decoder for as long as playback lasts, and the
+        // grid worker until its pass ends.
         self.stop_playback_and_wait();
+        let was_reading = self.stop_extraction_and_wait();
         if let Err(e) = trash::delete(&path) {
             log::error!("failed to delete {}: {e}", path.display());
+            // The read was stopped to free the file and the bin turned it down
+            // anyway, so start it again. The grid is what prev/next and a second
+            // DEL work from; without it the user is left at an error with no way
+            // out but the open dialog.
+            if was_reading {
+                self.loaded = Some(spawn_extraction(ctx, path.clone()));
+            }
             self.error = Some(format!(
                 "Could not send \"{}\" to the Recycle Bin — it may still be in use.",
                 display_name(&path)
@@ -649,6 +665,33 @@ impl App {
         }
     }
 
+    /// Stop the loaded clip's grid worker and wait for it to let go of the file,
+    /// dropping the partial grid with it. Returns whether it was still reading, so
+    /// a caller that only wanted the file free can put the grid back.
+    ///
+    /// A finished grid is left alone, and that is not a shortcut: the worker sends
+    /// `Done` only after `extract_grid_streaming` has returned and its input is
+    /// dropped, so `done` already means the file is closed. It is also the common
+    /// case — a clip is usually studied before it is judged.
+    ///
+    /// Like the decoder, the worker holds the clip open until it returns, and it
+    /// cannot merely be flagged and joined: one parked on a full queue waits on a
+    /// send that only fails once the receiver is gone, so the join would hang on
+    /// exactly the worker that ignores the flag. Dropping `Loaded` does both —
+    /// `Drop` raises the flag and the receiver goes with it.
+    fn stop_extraction_and_wait(&mut self) -> bool {
+        let Some(l) = &mut self.loaded else { return false };
+        if l.done {
+            return false;
+        }
+        let worker = l.worker.take();
+        self.loaded = None;
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+        true
+    }
+
     /// Draw the playing clip filling the window and handle its keys. A click in
     /// the video area, Enter, or a decode error returns to the grid; Escape closes
     /// the app. A scrubber along the bottom shows the position and seeks on drag or
@@ -681,7 +724,7 @@ impl App {
         // DEL sends the current clip to the recycle bin and moves to the next,
         // staying in playback (or dropping to the empty grid if it was the last).
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-            if let Some(next) = self.delete_current() {
+            if let Some(next) = self.delete_current(ctx) {
                 self.open(ctx, next);
                 self.play(ctx, 0.0);
             }
@@ -892,7 +935,7 @@ fn spawn_extraction(ctx: &egui::Context, path: PathBuf) -> Loaded {
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let result = media::extract_grid_streaming(
             &worker_path,
             THUMB_SPACING_S,
@@ -924,6 +967,7 @@ fn spawn_extraction(ctx: &egui::Context, path: PathBuf) -> Loaded {
         rx,
         cursor: 0,
         cancel,
+        worker: Some(worker),
     }
 }
 
@@ -984,7 +1028,7 @@ impl eframe::App for App {
 
         // DEL sends the current clip to the recycle bin and opens the next one.
         if self.loaded.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-            if let Some(next) = self.delete_current() {
+            if let Some(next) = self.delete_current(&ctx) {
                 self.open(&ctx, next);
             }
             return;
@@ -1188,6 +1232,7 @@ mod tests {
             rx,
             cursor: 0,
             cancel,
+            worker: None,
         }
     }
 
@@ -1339,6 +1384,65 @@ mod tests {
             },
             exited,
         )
+    }
+
+    /// A grid whose worker is parked on a full queue, as a read-ahead's always is
+    /// and the foreground's can be for a frame. This is the case that dictates the
+    /// order inside `stop_extraction_and_wait`: the flag alone never reaches a
+    /// worker blocked in a send. The flag rises only once the thread is gone — the
+    /// moment a real worker would drop its input and let go of the file.
+    fn parked_extraction() -> (Loaded, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::sync_channel::<Msg>(1);
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&exited);
+        let worker = thread::spawn(move || {
+            // Fills the queue, then blocks in a send exactly as `on_thumb` does,
+            // and is freed only by the receiver going away.
+            while tx.send(Msg::Done).is_ok() {}
+            thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let mut l = fake_loaded("a.mp4", 0, false, Arc::new(AtomicBool::new(false)));
+        l.rx = rx;
+        l.worker = Some(worker);
+        (l, exited)
+    }
+
+    /// Stopping a grid that is still reading waits for its worker to exit, and a
+    /// worker parked on a full queue must not turn that wait into a hang.
+    #[test]
+    fn stopping_a_reading_grid_waits_for_a_parked_worker_to_exit() {
+        let mut app = App::new(None);
+        let (loaded, exited) = parked_extraction();
+        app.loaded = Some(loaded);
+
+        let was_reading = app.stop_extraction_and_wait();
+
+        assert!(was_reading, "a grid mid-read should report that it was stopped");
+        assert!(app.loaded.is_none(), "the partial grid should be gone");
+        assert!(
+            exited.load(Ordering::Relaxed),
+            "returned while the worker still had the clip open"
+        );
+    }
+
+    /// A finished grid is left alone: its worker already dropped the clip's file
+    /// before reporting `Done`, so there is nothing to wait for and a grid worth
+    /// keeping. This is what spares the common delete a needless re-read.
+    #[test]
+    fn stopping_a_finished_grid_keeps_it() {
+        let mut app = App::new(None);
+        app.loaded = Some(fake_loaded(
+            "a.mp4",
+            5,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let was_reading = app.stop_extraction_and_wait();
+
+        assert!(!was_reading, "a finished grid was not reading");
+        assert!(app.loaded.is_some(), "a finished grid should have been kept");
     }
 
     /// Leaving playback for a delete waits for the decoder to actually exit.
