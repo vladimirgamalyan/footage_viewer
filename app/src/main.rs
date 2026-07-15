@@ -93,6 +93,12 @@ const STILL_JPEG_QUALITY: u8 = 92;
 const FLASH_HOLD_S: f64 = 0.35;
 const FLASH_FADE_S: f64 = 0.35;
 
+/// How long the help plate takes to fade once H is let go, in seconds. Shorter
+/// than a [`Flash`]'s: that one has to be noticed by someone who was not
+/// expecting it, while this one is dismissed by the hand that summoned it and
+/// should be out of the way as fast as it can be without simply blinking out.
+const HELP_FADE_S: f64 = 0.2;
+
 /// Font family holding the [`Flash`] icons, installed by [`install_icon_font`].
 const ICON_FONT: &str = "icons";
 
@@ -102,6 +108,43 @@ const WRITER_GONE: &str = "the writer stopped unexpectedly";
 
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
+
+/// What the help plate lists: a section heading and the keys under it.
+///
+/// Keys only. Clicking a thumbnail or dragging the scrubber is found by simply
+/// using the mouse, whereas nothing on screen announces any of these — which is
+/// what the plate exists to fix.
+///
+/// The sections earn their place: several keys mean different things depending
+/// on the view, so a flat list would contradict itself on Enter and A/D.
+/// H itself is left out — it is being held down to read this.
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Anywhere",
+        &[
+            ("Left / Right", "Previous / next clip in the folder"),
+            ("I", "Save the current frame as a JPEG beside the clip"),
+            ("Del", "Send the clip to the Recycle Bin and open the next"),
+            ("Esc", "Close the app"),
+        ],
+    ),
+    (
+        "Grid",
+        &[
+            ("W A S D", "Move the frame cursor"),
+            ("Enter", "Play from the selected frame"),
+            ("+ / -", "Larger / smaller thumbnails"),
+        ],
+    ),
+    (
+        "Playback",
+        &[
+            ("Space", "Pause or resume"),
+            ("A / D", "Step half a second back / forward, and pause"),
+            ("Enter", "Back to the grid"),
+        ],
+    ),
+];
 
 /// True if `path` has a recognized video extension (case-insensitive).
 fn is_video(path: &Path) -> bool {
@@ -263,6 +306,40 @@ struct Flash {
     started_s: f64,
 }
 
+/// The help plate's state: solid for as long as H is held, then fading out from
+/// the egui time it was let go.
+#[derive(Default, Clone, Copy)]
+enum Help {
+    #[default]
+    Hidden,
+    Held,
+    Fading(f64),
+}
+
+impl Help {
+    /// What H being `held` at `now` means for the plate: the state to keep, and
+    /// how opaque to draw it — `None` once it is gone entirely.
+    ///
+    /// Split from the drawing so the fade can be tested without a live window.
+    fn advance(self, held: bool, now: f64) -> (Self, Option<f32>) {
+        match (self, held) {
+            // Taking H back mid-fade is a plain return to solid, which is why
+            // this arm ignores the state it came from.
+            (_, true) => (Self::Held, Some(1.0)),
+            (Self::Held, false) => (Self::Fading(now), Some(1.0)),
+            (Self::Fading(let_go_s), false) => {
+                let left = 1.0 - (now - let_go_s) / HELP_FADE_S;
+                if left <= 0.0 {
+                    (Self::Hidden, None)
+                } else {
+                    (Self::Fading(let_go_s), Some(left as f32))
+                }
+            }
+            (Self::Hidden, false) => (Self::Hidden, None),
+        }
+    }
+}
+
 /// A still being written on a background thread: where it is going, and the
 /// channel its outcome arrives on.
 ///
@@ -370,6 +447,8 @@ struct App {
     grid_cols: usize,
     /// The confirmation icon currently fading over the view, if any.
     flash: Option<Flash>,
+    /// The plate listing the keys, shown for as long as H is held.
+    help: Help,
     /// The still being written, if any. At most one runs at a time — see
     /// [`save_still`](App::save_still).
     saving: Option<Saving>,
@@ -737,6 +816,65 @@ impl App {
                     });
             });
         ctx.request_repaint();
+    }
+
+    /// Draw the plate listing the keys ([`HELP`]) for as long as H is held.
+    ///
+    /// Held rather than toggled, so it is never left standing over the very clip
+    /// it explains and needs no key of its own to dismiss. It is drawn like a
+    /// [`Flash`] and for the same reasons: its own foreground layer over
+    /// whichever view is up, run before either is built since playback returns
+    /// early, and not interactable so clicks reach the clip underneath.
+    fn help_ui(&mut self, ctx: &egui::Context) {
+        let (held, now) = ctx.input(|i| (i.key_down(egui::Key::H), i.time));
+        let (state, alpha) = self.help.advance(held, now);
+        self.help = state;
+        let Some(alpha) = alpha else { return };
+
+        let text = |s: &str, gray: u8| {
+            egui::RichText::new(s).color(egui::Color32::from_gray(gray).gamma_multiply(alpha))
+        };
+        egui::Area::new(egui::Id::new("help"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .interactable(false)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_black_alpha(210).gamma_multiply(alpha))
+                    .corner_radius(16.0)
+                    .inner_margin(18.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("help_keys")
+                            .num_columns(2)
+                            .spacing([18.0, 6.0])
+                            .show(ui, |ui| {
+                                for (i, (section, keys)) in HELP.iter().enumerate() {
+                                    if i > 0 {
+                                        ui.end_row(); // blank row between sections
+                                    }
+                                    // The heading is the dimmest thing on the
+                                    // plate: it is a label for the block under
+                                    // it, and the keys are what is being read.
+                                    ui.label(text(section, 140));
+                                    ui.end_row();
+                                    for (key, what) in *keys {
+                                        ui.label(text(key, 255).monospace());
+                                        ui.label(text(what, 190));
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    });
+            });
+
+        // The fade is ours to drive: nothing else asks for repaints once a grid
+        // is finished, so without this the plate would freeze at whatever
+        // opacity the last incidental frame caught and stay there. While H is
+        // held the picture is static, so it costs nothing to leave it alone.
+        if !held {
+            ctx.request_repaint();
+        }
     }
 
     /// Ask for a full-resolution JPEG of the frame at `time_s`, written next to
@@ -1278,6 +1416,7 @@ impl eframe::App for App {
         // Before the views, so the early returns below cannot skip it; it draws
         // over them from its own layer regardless.
         self.flash_ui(&ctx);
+        self.help_ui(&ctx);
 
         // While a clip is playing it fills the window; the grid and its keys are
         // hidden until playback ends or Escape returns here.
@@ -1950,6 +2089,42 @@ mod tests {
             app.recent.is_empty(),
             "a grid over the budget should not be cached"
         );
+    }
+
+    /// The plate is solid while H is held, fades from the moment it is let go,
+    /// and is gone once the fade runs out.
+    #[test]
+    fn the_help_plate_holds_then_fades_out() {
+        let (held, alpha) = Help::default().advance(true, 0.0);
+        assert!(matches!(held, Help::Held), "holding H should show the plate");
+        assert_eq!(alpha, Some(1.0), "a held plate is solid");
+
+        let (fading, alpha) = held.advance(false, 10.0);
+        assert!(matches!(fading, Help::Fading(_)), "letting go should start the fade");
+        assert_eq!(alpha, Some(1.0), "the fade starts from solid");
+
+        let (fading, alpha) = fading.advance(false, 10.0 + HELP_FADE_S / 2.0);
+        let alpha = alpha.expect("half way through, the plate is still on screen");
+        assert!((alpha - 0.5).abs() < 0.01, "half way through the fade alpha was {alpha}");
+
+        // Past the end of the fade rather than exactly on it: the boundary lands
+        // on a float that rounds to a hair above zero, and no real frame ever
+        // arrives on it anyway.
+        let (gone, alpha) = fading.advance(false, 10.0 + HELP_FADE_S * 2.0);
+        assert!(matches!(gone, Help::Hidden), "the fade should have ended");
+        assert_eq!(alpha, None, "a faded-out plate is not drawn at all");
+    }
+
+    /// Taking H back mid-fade brings the plate straight back to solid, rather
+    /// than carrying on fading out from under the key that is asking for it.
+    #[test]
+    fn holding_h_again_mid_fade_brings_the_plate_back() {
+        let (state, _) = Help::Fading(10.0).advance(false, 10.0 + HELP_FADE_S / 2.0);
+
+        let (state, alpha) = state.advance(true, 10.0 + HELP_FADE_S / 2.0 + 0.01);
+
+        assert!(matches!(state, Help::Held), "H should have taken the plate back");
+        assert_eq!(alpha, Some(1.0), "the plate should be solid again, not still fading");
     }
 
     #[test]
