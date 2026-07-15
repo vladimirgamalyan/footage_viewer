@@ -205,9 +205,16 @@ fn main() -> eframe::Result<()> {
 
     media::init().expect("failed to initialize ffmpeg");
 
-    let pending = std::env::args().nth(1).map(PathBuf::from);
+    let mut pending = std::env::args().nth(1).map(PathBuf::from);
     if let Some(p) = &pending {
-        log::info!("initial clip from command line: {}", p.display());
+        if is_video(p) {
+            log::info!("initial clip from command line: {}", p.display());
+        } else {
+            // Same as a dropped non-video: start empty rather than on a grid
+            // that can never fill.
+            log::warn!("ignoring unsupported file from command line: {}", p.display());
+            pending = None;
+        }
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1403,10 +1410,17 @@ impl eframe::App for App {
         if let Some(path) = self.pending_open.take() {
             self.open(&ctx, path);
         }
-        // Open a dropped file (last one wins).
-        if let Some(path) =
-            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).last())
-        {
+        // Open a dropped file (last video dropped wins). Anything else is
+        // ignored: extraction finds no video stream, so the app would sit on a
+        // named-but-empty grid where every key does nothing.
+        if let Some(path) = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .filter(|p| is_video(p))
+                .last()
+        }) {
             self.open(&ctx, path);
         }
 
@@ -2171,6 +2185,17 @@ mod tests {
         assert_eq!(move_cursor(7, n, cols, 0, 1), 9); // col 3 row 2 -> would be 11, clamped to 9
         // An empty grid stays put.
         assert_eq!(move_cursor(0, 0, cols, 1, 1), 0);
+    }
+
+    /// The gate on both ways a clip gets in from outside — a drop and the
+    /// command line. A still saved by "I" lands right next to the clip it came
+    /// from, which is exactly how a jpg ends up dropped on the window.
+    #[test]
+    fn is_video_spots_a_clip_whatever_the_case_and_nothing_else() {
+        assert!(is_video(Path::new("a.mp4")));
+        assert!(is_video(Path::new("a.MOV")));
+        assert!(!is_video(Path::new("a.jpg")));
+        assert!(!is_video(Path::new("a"))); // no extension at all
     }
 
     #[test]
