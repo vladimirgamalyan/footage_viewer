@@ -97,6 +97,16 @@ fn is_video(path: &Path) -> bool {
         .is_some_and(|e| VIDEO_EXTS.iter().any(|v| v.eq_ignore_ascii_case(e)))
 }
 
+/// A file's name for a message to the user. The full path is noise in a label
+/// that already sits over the very clip it names, and the target's paths are
+/// long. Falls back to the whole path for the odd one with no final component.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Sibling video files sharing `current`'s directory, sorted by file name.
 /// Read fresh from disk on every call so files added while the app is running
 /// are picked up.
@@ -589,7 +599,10 @@ impl App {
         self.stop_playback_and_wait();
         if let Err(e) = trash::delete(&path) {
             log::error!("failed to delete {}: {e}", path.display());
-            self.error = Some(format!("Failed to delete {}: {e}", path.display()));
+            self.error = Some(format!(
+                "Could not send \"{}\" to the Recycle Bin — it may still be in use.",
+                display_name(&path)
+            ));
             return None;
         }
         log::info!("deleted clip {}", path.display());
@@ -602,7 +615,10 @@ impl App {
         if still.exists() {
             if let Err(e) = trash::delete(&still) {
                 log::error!("failed to delete sidecar {}: {e}", still.display());
-                self.error = Some(format!("Failed to delete {}: {e}", still.display()));
+                self.error = Some(format!(
+                    "Deleted the clip, but its still \"{}\" stayed — it may still be in use.",
+                    display_name(&still)
+                ));
             }
         }
         target
