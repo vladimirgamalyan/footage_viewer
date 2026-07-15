@@ -87,6 +87,15 @@ const SEEK_REPEAT_INTERVAL_S: f64 = 0.12;
 /// subsampling and near-lossless detail at a reasonable file size.
 const STILL_JPEG_QUALITY: u8 = 92;
 
+/// How long a [`Flash`] stays at full opacity, and how long it then takes to
+/// fade, in seconds. Long enough to register, short enough to be gone before it
+/// is in the way of the clip underneath.
+const FLASH_HOLD_S: f64 = 0.35;
+const FLASH_FADE_S: f64 = 0.35;
+
+/// Font family holding the [`Flash`] icons, installed by [`install_icon_font`].
+const ICON_FONT: &str = "icons";
+
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 
@@ -165,7 +174,10 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "footage_viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(pending)))),
+        Box::new(|cc| {
+            install_icon_font(&cc.egui_ctx);
+            Ok(Box::new(App::new(pending)))
+        }),
     );
     match &result {
         Ok(()) => log::info!("exiting normally"),
@@ -196,6 +208,55 @@ enum Cell {
 enum PlayMsg {
     Frame(media::PlaybackFrame),
     Err(String),
+}
+
+/// What a [`Flash`] is confirming.
+#[derive(Clone, Copy)]
+enum FlashKind {
+    StillSaved,
+    Deleted,
+}
+
+impl FlashKind {
+    /// The glyph to show, drawn in the [`ICON_FONT`] family. Both are monochrome
+    /// there, so they take whatever colour the fade asks for.
+    fn icon(self) -> &'static str {
+        match self {
+            Self::StillSaved => "📷",
+            Self::Deleted => "🗑",
+        }
+    }
+}
+
+/// Pin the [`Flash`] icons to a single font.
+///
+/// egui's default families chain across two emoji fonts, and the two glyphs land
+/// in different ones — the camera in NotoEmoji, the wastebasket in
+/// emoji-icon-font. They are drawn in different styles and their fonts carry
+/// different `FontTweak` scales, so one size request yields two visibly
+/// mismatched icons. emoji-icon-font has both, so a family pinned to it alone
+/// keeps the two confirmations looking like a pair.
+fn install_icon_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.families.insert(
+        egui::FontFamily::Name(ICON_FONT.into()),
+        vec!["emoji-icon-font".to_owned()],
+    );
+    ctx.set_fonts(fonts);
+}
+
+/// A brief confirmation of an action that would otherwise leave no mark on
+/// screen: saving a still writes a file the app never shows, and deleting a clip
+/// looks the same as stepping to the next one. Shown centered over whatever view
+/// is up and faded out after [`FLASH_HOLD_S`] + [`FLASH_FADE_S`].
+struct Flash {
+    kind: FlashKind,
+    /// The file the action acted on. Named because the icon alone is ambiguous:
+    /// by the time the wastebasket appears the *next* clip is already open
+    /// underneath it, so without this it reads as if that one had been binned.
+    name: String,
+    /// egui time it was raised, which the fade is measured from.
+    started_s: f64,
 }
 
 /// Active playback of the loaded clip, filling the window. One live decoder
@@ -287,6 +348,8 @@ struct App {
     /// How many columns the frame grid shows; changed with the `-`/`+` keys and
     /// kept across clips. Clamped to [`GRID_COLS_MIN`]..=[`GRID_COLS_MAX`].
     grid_cols: usize,
+    /// The confirmation icon currently fading over the view, if any.
+    flash: Option<Flash>,
     error: Option<String>,
     /// The clip path currently reflected in the window title, so the title is
     /// only updated when the loaded clip actually changes.
@@ -570,10 +633,90 @@ impl App {
         }
     }
 
+    /// Raise the confirmation icon for `kind` naming `path`, replacing whatever
+    /// flash was still fading.
+    ///
+    /// The repaint request is what animates it: neither view drives repaints of
+    /// its own once it is idle, so without this the flash would freeze at
+    /// whatever the next incidental frame caught and never fade out.
+    fn show_flash(&mut self, ctx: &egui::Context, kind: FlashKind, path: &Path) {
+        self.flash = Some(Flash {
+            kind,
+            name: display_name(path),
+            started_s: ctx.input(|i| i.time),
+        });
+        ctx.request_repaint();
+    }
+
+    /// Draw the flash over the view, and drop it once it has faded out.
+    ///
+    /// It goes in its own foreground layer, so it lands on top whichever view is
+    /// up and regardless of when in the frame this runs. That is what lets it run
+    /// before either view is built — ahead of the early returns that would
+    /// otherwise skip it on exactly the paths that raise it. The cost is that a
+    /// flash raised later in the same frame first shows on the next one, which is
+    /// the repaint [`show_flash`](Self::show_flash) asks for.
+    fn flash_ui(&mut self, ctx: &egui::Context) {
+        let Some(f) = &self.flash else { return };
+        let age = ctx.input(|i| i.time) - f.started_s;
+        if age >= FLASH_HOLD_S + FLASH_FADE_S {
+            self.flash = None;
+            return;
+        }
+        let alpha: f32 = if age <= FLASH_HOLD_S {
+            1.0
+        } else {
+            (1.0 - (age - FLASH_HOLD_S) / FLASH_FADE_S) as f32
+        };
+
+        // The icon sits on a dark plate because the backdrop is not one thing: a
+        // bare white glyph reads over playback's black, but is lost among the
+        // thumbnails of the grid.
+        egui::Area::new(egui::Id::new("flash"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .interactable(false)
+            // The fade is ours; egui's own fade-in would fight it.
+            .fade_in(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_black_alpha(180).gamma_multiply(alpha))
+                    .corner_radius(16.0)
+                    .inner_margin(18.0)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(f.kind.icon())
+                                    .font(egui::FontId::new(
+                                        64.0,
+                                        egui::FontFamily::Name(ICON_FONT.into()),
+                                    ))
+                                    .color(egui::Color32::WHITE.gamma_multiply(alpha)),
+                            );
+                            // Extend, not wrap: the plate is sized by its
+                            // content, and a wrapping name would be laid out
+                            // against a width that the name itself decides —
+                            // so a name broke across two lines depending on
+                            // which pass won. Letting it size the plate keeps
+                            // one line and one predictable shape.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(f.name.as_str())
+                                        .size(13.0)
+                                        .color(egui::Color32::from_gray(190).gamma_multiply(alpha)),
+                                )
+                                .extend(),
+                            );
+                        });
+                    });
+            });
+        ctx.request_repaint();
+    }
+
     /// Save a full-resolution JPEG of the frame at `time_s` next to the loaded
     /// clip as `<clip-stem>.jpg`, overwriting any existing file. A no-op with
     /// nothing loaded; records the reason in `self.error` on failure.
-    fn save_still(&mut self, time_s: f64) {
+    fn save_still(&mut self, ctx: &egui::Context, time_s: f64) {
         let Some(l) = &self.loaded else { return };
         let out = l.path.with_extension("jpg");
         if let Err(e) = media::save_frame_jpeg(&l.path, time_s, &out, STILL_JPEG_QUALITY) {
@@ -584,6 +727,10 @@ impl App {
             ));
         } else {
             log::info!("saved still {}", out.display());
+            // Names the still rather than the clip: the file is written next to
+            // the clip and never shown, so where it went is the one thing the
+            // confirmation can usefully say.
+            self.show_flash(ctx, FlashKind::StillSaved, &out);
         }
     }
 
@@ -625,6 +772,7 @@ impl App {
             return None;
         }
         log::info!("deleted clip {}", path.display());
+        self.show_flash(ctx, FlashKind::Deleted, &path);
         // Drop the binned clip's grid rather than let the next `open` park it in
         // the recent cache: it would hold texture memory for a file that is gone
         // and that prev/next can never reach again, since they re-scan the folder.
@@ -757,7 +905,7 @@ impl App {
         // "I" saves the currently shown frame as a still next to the clip.
         if ctx.input(|i| i.key_pressed(egui::Key::I)) {
             if let Some(t) = self.player.as_ref().map(|p| p.position_s) {
-                self.save_still(t);
+                self.save_still(ctx, t);
             }
         }
 
@@ -1016,6 +1164,9 @@ impl eframe::App for App {
         self.poll(&ctx);
         self.sync_title(&ctx);
         self.look_ahead(&ctx);
+        // Before the views, so the early returns below cannot skip it; it draws
+        // over them from its own layer regardless.
+        self.flash_ui(&ctx);
 
         // While a clip is playing it fills the window; the grid and its keys are
         // hidden until playback ends or Escape returns here.
@@ -1205,7 +1356,7 @@ impl eframe::App for App {
             self.play(&ctx, t);
         }
         if let Some(t) = save_still_at {
-            self.save_still(t);
+            self.save_still(&ctx, t);
         }
     }
 }
