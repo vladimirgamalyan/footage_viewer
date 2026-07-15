@@ -1042,16 +1042,16 @@ impl eframe::App for App {
         // layouts "+" is Shift+"=". The cursor is an absolute cell index, so it
         // stays valid across a column change with no fix-up needed.
         if self.loaded.is_some() {
-            let (shrink, grow) = ctx.input(|i| {
+            let (zoom_in, zoom_out) = ctx.input(|i| {
                 (
-                    i.key_pressed(egui::Key::Minus),
                     i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                    i.key_pressed(egui::Key::Minus),
                 )
             });
-            if shrink {
+            if zoom_in {
                 self.grid_cols = self.grid_cols.saturating_sub(1).max(GRID_COLS_MIN);
             }
-            if grow {
+            if zoom_out {
                 self.grid_cols = (self.grid_cols + 1).min(GRID_COLS_MAX);
             }
         }
