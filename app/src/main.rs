@@ -96,6 +96,10 @@ const FLASH_FADE_S: f64 = 0.35;
 /// Font family holding the [`Flash`] icons, installed by [`install_icon_font`].
 const ICON_FONT: &str = "icons";
 
+/// Reported when the thread writing a still goes away without an outcome, which
+/// means it panicked. Said rather than left pending forever.
+const WRITER_GONE: &str = "the writer stopped unexpectedly";
+
 /// Extensions we treat as video, for both the open dialog and prev/next navigation.
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 
@@ -259,6 +263,22 @@ struct Flash {
     started_s: f64,
 }
 
+/// A still being written on a background thread: where it is going, and the
+/// channel its outcome arrives on.
+///
+/// Writing one is not cheap — it opens the clip afresh, seeks, decodes a frame
+/// at full source resolution and encodes a JPEG — and on the 4K footage this
+/// tool targets that is long enough to be seen as a freeze if it runs on the UI
+/// thread. See [`save_still`](App::save_still).
+struct Saving {
+    out: PathBuf,
+    /// The time in the clip being saved, kept for the log a failure writes —
+    /// which frame was asked for is what makes one reproducible.
+    time_s: f64,
+    /// `Ok` once the still is written, else why it failed.
+    rx: Receiver<Result<(), String>>,
+}
+
 /// Active playback of the loaded clip, filling the window. One live decoder
 /// thread paces frames to real time and reacts to [`media::PlayCommand`]s; the UI
 /// sends commands (seek/pause) and displays whatever frame last arrived.
@@ -350,6 +370,12 @@ struct App {
     grid_cols: usize,
     /// The confirmation icon currently fading over the view, if any.
     flash: Option<Flash>,
+    /// The still being written, if any. At most one runs at a time — see
+    /// [`save_still`](App::save_still).
+    saving: Option<Saving>,
+    /// A still asked for while another was being written: the clip, and the time
+    /// in it to save. Started once the running one lands.
+    pending_save: Option<(PathBuf, f64)>,
     error: Option<String>,
     /// The clip path currently reflected in the window title, so the title is
     /// only updated when the loaded clip actually changes.
@@ -713,25 +739,107 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// Save a full-resolution JPEG of the frame at `time_s` next to the loaded
-    /// clip as `<clip-stem>.jpg`, overwriting any existing file. A no-op with
-    /// nothing loaded; records the reason in `self.error` on failure.
+    /// Ask for a full-resolution JPEG of the frame at `time_s`, written next to
+    /// the loaded clip as `<clip-stem>.jpg` and overwriting any existing file.
+    /// A no-op with nothing loaded. The write happens on a background thread, so
+    /// this returns at once and the outcome lands later in
+    /// [`poll_save`](Self::poll_save).
+    ///
+    /// Only one runs at a time, and a request arriving while one is in flight is
+    /// held rather than started. Two saves of the same clip write the same
+    /// `<clip-stem>.jpg`, so running both would leave two threads racing on one
+    /// file; holding the later one and letting it win when the running save
+    /// lands is also what the synchronous save did, since it simply overwrote
+    /// whatever the earlier press had put there.
     fn save_still(&mut self, ctx: &egui::Context, time_s: f64) {
         let Some(l) = &self.loaded else { return };
-        let out = l.path.with_extension("jpg");
-        if let Err(e) = media::save_frame_jpeg(&l.path, time_s, &out, STILL_JPEG_QUALITY) {
-            log::error!("failed to save still {} at {time_s:.3}s: {e:#}", out.display());
-            self.error = Some(format!(
-                "Could not save the still \"{}\": {e:#}",
-                display_name(&out)
-            ));
-        } else {
-            log::info!("saved still {}", out.display());
-            // Names the still rather than the clip: the file is written next to
-            // the clip and never shown, so where it went is the one thing the
-            // confirmation can usefully say.
-            self.show_flash(ctx, FlashKind::StillSaved, &out);
+        let request = (l.path.clone(), time_s);
+        if self.saving.is_some() {
+            self.pending_save = Some(request);
+            return;
         }
+        self.start_save(ctx, request);
+    }
+
+    /// Start writing the frame at `time_s` of `path` on a background thread.
+    fn start_save(&mut self, ctx: &egui::Context, (path, time_s): (PathBuf, f64)) {
+        let out = path.with_extension("jpg");
+        let (tx, rx) = mpsc::channel();
+        let (ctx_end, worker_out) = (ctx.clone(), out.clone());
+        thread::spawn(move || {
+            let result = media::save_frame_jpeg(&path, time_s, &worker_out, STILL_JPEG_QUALITY)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            // Wake the UI so it delivers the outcome; nothing else is driving
+            // repaints while the app sits on a finished grid.
+            ctx_end.request_repaint();
+        });
+        self.saving = Some(Saving { out, time_s, rx });
+    }
+
+    /// Take the outcome of a save that has landed: confirm it, or record why it
+    /// failed. Then start whatever request was held behind it.
+    fn settle_save(&mut self, ctx: &egui::Context, s: Saving, result: Result<(), String>) {
+        let out = s.out;
+        match result {
+            Ok(()) => {
+                log::info!("saved still {}", out.display());
+                // Names the still rather than the clip: the file is written next
+                // to the clip and never shown, so where it went is the one thing
+                // the confirmation can usefully say.
+                self.show_flash(ctx, FlashKind::StillSaved, &out);
+            }
+            Err(e) => {
+                log::error!(
+                    "failed to save still {} at {:.3}s: {e}",
+                    out.display(),
+                    s.time_s
+                );
+                self.error = Some(format!(
+                    "Could not save the still \"{}\": {e}",
+                    display_name(&out)
+                ));
+            }
+        }
+        if let Some(request) = self.pending_save.take() {
+            self.start_save(ctx, request);
+        }
+    }
+
+    /// Deliver the outcome of a still being written, once it has one.
+    fn poll_save(&mut self, ctx: &egui::Context) {
+        let Some(s) = &self.saving else { return };
+        let result = match s.rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(WRITER_GONE.to_owned()),
+        };
+        let Some(s) = self.saving.take() else { return };
+        self.settle_save(ctx, s, result);
+    }
+
+    /// Wait for a still being written to land, so the clip it reads is closed by
+    /// the time this returns. A no-op with no save in flight.
+    ///
+    /// A save holds its clip open while it decodes, and Windows will not bin a
+    /// file that is open. Unlike the grid worker there is nothing to cancel —
+    /// `save_frame_jpeg` takes no cancel flag, and half a JPEG would be worth
+    /// less than the wait saves — so the delete waits it out.
+    ///
+    /// Receiving is enough to know the file is closed: the worker sends only
+    /// after `save_frame_jpeg` has returned and dropped the input it opened,
+    /// which is the same reasoning [`stop_extraction_and_wait`] leans on to
+    /// leave a finished grid alone.
+    ///
+    /// [`stop_extraction_and_wait`]: Self::stop_extraction_and_wait
+    fn finish_save_and_wait(&mut self, ctx: &egui::Context) {
+        let Some(s) = self.saving.take() else { return };
+        let result = s.rx.recv().unwrap_or_else(|_| Err(WRITER_GONE.to_owned()));
+        // Drop a request held behind it before settling, or `settle_save` would
+        // start it and hand the clip straight back to a reader — the one thing
+        // the caller waited to be rid of.
+        self.pending_save = None;
+        self.settle_save(ctx, s, result);
     }
 
     /// Send the currently loaded clip to the recycle bin without confirmation
@@ -741,21 +849,23 @@ impl App {
     /// the folder is now empty. On a successful delete the binned clip's grid is
     /// dropped, so the caller can simply return to the empty view.
     ///
-    /// Both of the clip's readers stop first — playback, and a grid still being
-    /// extracted — since each holds the file open and Windows will not bin it
-    /// until they let go. A caller that was playing therefore replays the clip it
-    /// is handed rather than carrying on. A delete that fails lands back on the
-    /// grid with the reason showing, and an interrupted read is started again so
-    /// that grid is whole.
+    /// All three of the clip's readers stop first — playback, a grid still being
+    /// extracted, and a still being written — since each holds the file open and
+    /// Windows will not bin it until they let go. A caller that was playing
+    /// therefore replays the clip it is handed rather than carrying on. A delete
+    /// that fails lands back on the grid with the reason showing, and an
+    /// interrupted read is started again so that grid is whole.
     fn delete_current(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let path = self.loaded.as_ref()?.path.clone();
         // Resolve the neighbor before deleting, while the clip still lists.
         let target = self.neighbor(1).or_else(|| self.neighbor(-1));
         // Nothing of ours may still hold the clip open, or Windows refuses to bin
-        // it. Both readers do: the decoder for as long as playback lasts, and the
-        // grid worker until its pass ends.
+        // it. All three readers do: the decoder for as long as playback lasts,
+        // the grid worker until its pass ends, and a still being written until
+        // its frame is decoded.
         self.stop_playback_and_wait();
         let was_reading = self.stop_extraction_and_wait();
+        self.finish_save_and_wait(ctx);
         if let Err(e) = trash::delete(&path) {
             log::error!("failed to delete {}: {e}", path.display());
             // The read was stopped to free the file and the bin turned it down
@@ -1162,6 +1272,7 @@ impl eframe::App for App {
         }
 
         self.poll(&ctx);
+        self.poll_save(&ctx);
         self.sync_title(&ctx);
         self.look_ahead(&ctx);
         // Before the views, so the early returns below cannot skip it; it draws
@@ -1615,6 +1726,90 @@ mod tests {
             exited.load(Ordering::Relaxed),
             "returned while the decoder still had the clip open"
         );
+    }
+
+    /// A stand-in for a still being written. Like a real save it holds its clip
+    /// for a while and only then reports, so a wait that did not actually wait
+    /// is caught rather than passing on timing luck.
+    fn parked_save() -> (Saving, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed);
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(50));
+            // Ordered as the real worker is: the clip is closed when
+            // `save_frame_jpeg` returns, which is before the outcome is sent.
+            flag.store(true, Ordering::Relaxed);
+            let _ = tx.send(Ok(()));
+        });
+        (
+            Saving {
+                out: PathBuf::from("clip.jpg"),
+                time_s: 0.0,
+                rx,
+            },
+            closed,
+        )
+    }
+
+    /// Waiting for a still hands back a closed clip. A save reads the clip it is
+    /// taken from, and Windows refuses to bin a file that is still open, so a
+    /// delete racing a save would fail exactly as it did racing the decoder.
+    #[test]
+    fn waiting_for_a_still_returns_only_once_the_writer_let_go() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        let (saving, closed) = parked_save();
+        app.saving = Some(saving);
+
+        app.finish_save_and_wait(&ctx);
+
+        assert!(app.saving.is_none(), "the save should have been settled");
+        assert!(
+            closed.load(Ordering::Relaxed),
+            "returned while the writer still had the clip open"
+        );
+    }
+
+    /// A second still asked for while one is being written waits its turn.
+    /// Both write the same `<clip-stem>.jpg`, so starting the second would leave
+    /// two threads racing on the one file.
+    #[test]
+    fn a_still_asked_for_while_one_is_writing_is_held() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        app.loaded = Some(fake_loaded(
+            "clip.mp4",
+            1,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let (saving, _closed) = parked_save();
+        app.saving = Some(saving);
+
+        app.save_still(&ctx, 3.0);
+
+        assert!(
+            matches!(&app.pending_save, Some((p, t)) if p == Path::new("clip.mp4") && *t == 3.0),
+            "the request should have been held behind the running save"
+        );
+    }
+
+    /// Waiting for a still drops a request held behind it. Settling the wait
+    /// starts a held request, and the one caller that waits is a delete — which
+    /// would then bin a clip it had just handed back to a fresh reader.
+    #[test]
+    fn waiting_for_a_still_drops_the_request_held_behind_it() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        let (saving, _closed) = parked_save();
+        app.saving = Some(saving);
+        app.pending_save = Some((PathBuf::from("clip.mp4"), 3.0));
+
+        app.finish_save_and_wait(&ctx);
+
+        assert!(app.pending_save.is_none(), "the held request should be gone");
+        assert!(app.saving.is_none(), "no writer should have been started");
     }
 
     /// An app looking at a finished grid of `a.mp4`, with `b.mp4` next to it —
