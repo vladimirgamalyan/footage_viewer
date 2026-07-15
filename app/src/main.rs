@@ -195,6 +195,10 @@ struct Player {
     /// Commands to the live decoder: seek, pause, resume, stop.
     cmds: mpsc::Sender<media::PlayCommand>,
     rx: Receiver<PlayMsg>,
+    /// The live decoder thread, which holds the clip's file open for as long as
+    /// it runs. Joined by [`stop_playback_and_wait`](App::stop_playback_and_wait)
+    /// when the file itself must be free; `None` only while being torn down.
+    decoder: Option<thread::JoinHandle<()>>,
     tex: Option<egui::TextureHandle>,
     frame_size: egui::Vec2,
     /// Media time of the last shown frame, for the scrubber handle.
@@ -462,7 +466,7 @@ impl App {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<PlayMsg>(3);
         let (cmd_tx, cmd_rx) = mpsc::channel::<media::PlayCommand>();
         let ctx_frame = ctx.clone();
-        thread::spawn(move || {
+        let decoder = thread::spawn(move || {
             let result = media::play_stream(&path, start_from_s, PLAYBACK_LONG, cmd_rx, |f| {
                 let delivered = frame_tx.send(PlayMsg::Frame(f)).is_ok();
                 ctx_frame.request_repaint();
@@ -478,6 +482,7 @@ impl App {
         self.player = Some(Player {
             cmds: cmd_tx,
             rx: frame_rx,
+            decoder: Some(decoder),
             tex: None,
             frame_size: egui::Vec2::ZERO,
             position_s: start_from_s,
@@ -569,12 +574,19 @@ impl App {
     /// one if the deleted clip was the last in its folder. Returns `None` when
     /// nothing is loaded, the delete failed (reason recorded in `self.error`), or
     /// the folder is now empty. On a successful delete the binned clip's grid is
-    /// dropped, and in the empty case playback stops too, so the caller can
-    /// simply return to the empty view.
+    /// dropped, so the caller can simply return to the empty view.
+    ///
+    /// Playback always stops first, since the decoder has to release the file
+    /// before it can be binned. A caller that was playing therefore replays the
+    /// clip it is handed, and a delete that fails lands back on the grid with the
+    /// reason showing rather than silently carrying on playing.
     fn delete_current(&mut self) -> Option<PathBuf> {
         let path = self.loaded.as_ref()?.path.clone();
         // Resolve the neighbor before deleting, while the clip still lists.
         let target = self.neighbor(1).or_else(|| self.neighbor(-1));
+        // The clip cannot be binned while the decoder still has it open, and DEL
+        // is pressed from playback as often as from the grid.
+        self.stop_playback_and_wait();
         if let Err(e) = trash::delete(&path) {
             log::error!("failed to delete {}: {e}", path.display());
             self.error = Some(format!("Failed to delete {}: {e}", path.display()));
@@ -593,16 +605,32 @@ impl App {
                 self.error = Some(format!("Failed to delete {}: {e}", still.display()));
             }
         }
-        if target.is_none() {
-            // Deleted the only clip in the folder — nothing left to show.
-            self.player = None;
-        }
         target
     }
 
     /// Leave playback and fall back to the grid. A no-op when nothing is playing.
     fn stop_playback(&mut self) {
         self.player = None;
+    }
+
+    /// Leave playback and wait for the decoder to let go of the clip, so its file
+    /// is closed by the time this returns. A no-op when nothing is playing.
+    ///
+    /// Dropping the `Player` only closes the channels; the decoder notices that
+    /// and drops its open input some time later, on its own thread. Windows will
+    /// not bin a file that is still open, so a delete racing that shutdown fails
+    /// with a sharing violation — which is why the delete path waits and the
+    /// other exits from playback (which do not touch the file) do not.
+    ///
+    /// The channels must close before the join: a decoder parked on a full frame
+    /// channel only wakes because the send fails once the UI drops the receiver.
+    fn stop_playback_and_wait(&mut self) {
+        let Some(mut p) = self.player.take() else { return };
+        let decoder = p.decoder.take();
+        drop(p);
+        if let Some(decoder) = decoder {
+            let _ = decoder.join();
+        }
     }
 
     /// Draw the playing clip filling the window and handle its keys. A click in
@@ -1257,12 +1285,62 @@ mod tests {
         Player {
             cmds,
             rx,
+            decoder: None,
             tex: None,
             frame_size: egui::Vec2::ZERO,
             position_s: 0.0,
             paused: false,
             scrub: None,
         }
+    }
+
+    /// A player whose decoder parks on its command channel exactly as a paused
+    /// `play_stream` does, standing in for one holding the clip's file open. The
+    /// flag rises only once the thread is really gone — the moment a real decoder
+    /// would drop its input and let go of the file.
+    fn parked_player() -> (Player, Arc<AtomicBool>) {
+        let (cmds, cmd_rx) = mpsc::channel::<media::PlayCommand>();
+        let (_frame_tx, rx) = mpsc::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&exited);
+        let decoder = thread::spawn(move || {
+            while cmd_rx.recv().is_ok() {}
+            // A real decoder takes a moment to wind down after the channel closes;
+            // without it a missing join could still observe the flag set and pass.
+            thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+        (
+            Player {
+                cmds,
+                rx,
+                decoder: Some(decoder),
+                tex: None,
+                frame_size: egui::Vec2::ZERO,
+                position_s: 0.0,
+                paused: false,
+                scrub: None,
+            },
+            exited,
+        )
+    }
+
+    /// Leaving playback for a delete waits for the decoder to actually exit.
+    /// Windows refuses to bin a file that is still open, so returning while the
+    /// decoder holds it is what made DEL fail during playback.
+    #[test]
+    fn stopping_playback_for_a_delete_waits_for_the_decoder_to_exit() {
+        let mut app = App::new(None);
+        let (player, exited) = parked_player();
+        app.player = Some(player);
+
+        app.stop_playback_and_wait();
+
+        assert!(app.player.is_none(), "playback should be over");
+        assert!(
+            exited.load(Ordering::Relaxed),
+            "returned while the decoder still had the clip open"
+        );
     }
 
     /// An app looking at a finished grid of `a.mp4`, with `b.mp4` next to it —
