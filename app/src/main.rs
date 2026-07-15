@@ -147,6 +147,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Left / Right", "Previous / next clip in the folder"),
             ("I", "Save the current frame as a JPEG beside the clip"),
+            ("N", "Rename the clip"),
             ("Del", "Send the clip to the Recycle Bin and open the next"),
             ("F12", "Toggle fullscreen"),
             ("Esc", "Close the app"),
@@ -187,6 +188,42 @@ fn display_name(path: &Path) -> String {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+/// Character index the rename dialog opens its caret at: right before the
+/// extension's dot, so the name is what gets typed over and the `.mp4` is left
+/// alone. A name with no dot puts it at the end, there being no extension to
+/// keep clear of.
+///
+/// Counts characters rather than bytes because that is what a text caret is
+/// indexed by, and the archive's names are not all ASCII — a byte offset would
+/// land the caret mid-name on any of them, or inside a character.
+fn caret_before_ext(name: &str) -> usize {
+    let stem = name.rfind('.').unwrap_or(name.len());
+    name[..stem].chars().count()
+}
+
+/// Whether `candidate` names a file that is already there and is not `current`
+/// itself.
+///
+/// This is what stands between a typo and a lost clip: `fs::rename` overwrites
+/// its destination without a word, so renaming onto a sibling would silently
+/// bin footage that was never asked about.
+///
+/// Compared by canonical path rather than by name, because Windows matches file
+/// names case-insensitively: `Clip.mp4` "exists" when `clip.mp4` does, and a
+/// plain `exists()` would refuse to fix a clip's case — a rename onto itself,
+/// which the OS is perfectly happy to perform. Anything that cannot be resolved
+/// counts as taken: not knowing is a reason to leave a file alone, not to write
+/// over it.
+fn is_taken(candidate: &Path, current: &Path) -> bool {
+    if !candidate.exists() {
+        return false;
+    }
+    match (candidate.canonicalize(), current.canonicalize()) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => true,
+    }
 }
 
 /// Sibling video files sharing `current`'s directory, sorted by file name.
@@ -373,6 +410,22 @@ impl Help {
     }
 }
 
+/// The open rename dialog: the clip's name being edited over whichever view is
+/// up. See [`rename_ui`](App::rename_ui).
+struct Rename {
+    /// The name as typed so far, seeded from the clip's file name.
+    name: String,
+    /// Whether the field has been handed the focus and the caret. Cleared again
+    /// when a rename is refused, which hands both back — a refused name is one
+    /// to fix, and Enter has already dropped the focus by then.
+    seeded: bool,
+    /// Why the last attempt was refused, shown under the field; `None` until one
+    /// is. Kept here rather than in [`App::error`] because that one replaces the
+    /// whole grid with red text — the right weight for a clip that would not
+    /// delete, far too much for a name that needs a character changed.
+    error: Option<String>,
+}
+
 /// A still being written on a background thread: where it is going, and the
 /// channel its outcome arrives on.
 ///
@@ -547,6 +600,8 @@ struct App {
     flash: Option<Flash>,
     /// The plate listing the keys, shown for as long as H is held.
     help: Help,
+    /// The rename dialog, while one is open. See [`rename_ui`](Self::rename_ui).
+    rename: Option<Rename>,
     /// The still being written, if any. At most one runs at a time — see
     /// [`save_still`](App::save_still).
     saving: Option<Saving>,
@@ -977,6 +1032,217 @@ impl App {
         if !held {
             ctx.request_repaint();
         }
+    }
+
+    /// Open the rename dialog on the loaded clip, seeded with its file name.
+    ///
+    /// Playback is held first, and stays held once the dialog is gone: a clip
+    /// running on behind a dialog would be somewhere else by the time a name was
+    /// typed, and it is the frame that prompted the rename that the user is
+    /// looking at. Space resumes it, as it always does.
+    fn begin_rename(&mut self) {
+        let Some(l) = &self.loaded else { return };
+        self.rename = Some(Rename {
+            name: display_name(&l.path),
+            seeded: false,
+            error: None,
+        });
+        if let Some(p) = &mut self.player {
+            if !p.paused {
+                p.paused = true;
+                let _ = p.cmds.send(media::PlayCommand::Pause);
+            }
+        }
+    }
+
+    /// Draw the rename dialog and act on it, while one is open. Enter renames,
+    /// Escape or a click outside walks away, and a refused name stays up with
+    /// the reason under it.
+    ///
+    /// Drawn from its own layer before either view, like [`Flash`] and [`Help`]
+    /// and for the same reason: playback returns early, so a dialog built inside
+    /// a view could not serve both. Running first is also what lets it take the
+    /// keyboard — see the strip at the end.
+    fn rename_ui(&mut self, ctx: &egui::Context) {
+        // Taken rather than borrowed: the dialog is closed unless something
+        // below puts it back, so every way out of here — renamed, cancelled, or
+        // the clip going away underneath — leaves it shut on its own.
+        let Some(mut r) = self.rename.take() else { return };
+        // The clip can go out from under an open dialog: `poll` drops it when
+        // its extraction fails. There is then nothing left to rename.
+        if self.loaded.is_none() {
+            return;
+        }
+
+        let mut confirm = false;
+        let modal = egui::Modal::new(egui::Id::new("rename")).show(ctx, |ui| {
+            // Wide enough for the target archive's long names without the field
+            // scrolling, and the dialog is sized by it rather than by the name —
+            // so it doesn't resize itself under every keystroke.
+            ui.set_min_width(460.0);
+            ui.label("Rename clip");
+            ui.add_space(6.0);
+            let out = egui::TextEdit::singleline(&mut r.name)
+                .desired_width(f32::INFINITY)
+                .show(ui);
+            if !r.seeded {
+                // The field has no focus on the frame it first appears, so what
+                // is stored here is what it picks up when the focus lands next
+                // frame — ahead of the end-of-text caret TextEdit would
+                // otherwise start from.
+                out.response.request_focus();
+                let caret = egui::text::CCursor::new(caret_before_ext(&r.name));
+                let mut state = out.state;
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(caret)));
+                state.store(ctx, out.response.id);
+                r.seeded = true;
+            }
+            // Enter confirms. Read through `lost_focus` because that is what a
+            // single-line field does with Enter — it is the press that ends the
+            // edit, not any press while it runs.
+            confirm = out.response.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            if let Some(e) = &r.error {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+            }
+        });
+        // Escape, or a click on the backdrop.
+        let cancel = modal.should_close();
+
+        // The dialog owns the keyboard for the rest of the frame. Both views
+        // read keys straight off the input state rather than through the focus,
+        // so without this every letter of a name would drive them too: "a" and
+        // "d" would seek, "i" would write a still, "h" would raise the help
+        // plate. It has to come after the field has read its own events, which
+        // is why it sits here and not at the top of the frame. The pointer needs
+        // no such help — the modal's backdrop already blocks what is under it.
+        ctx.input_mut(|i| {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)));
+            i.keys_down.clear();
+        });
+
+        if cancel {
+            return;
+        }
+        if !confirm {
+            self.rename = Some(r);
+            return;
+        }
+        if let Err(e) = self.commit_rename(ctx, &r.name) {
+            // Stay up with the reason: a name that collides or lost its
+            // extension is a character to fix, not a dialog to start over.
+            r.error = Some(e);
+            r.seeded = false;
+            self.rename = Some(r);
+        }
+    }
+
+    /// Rename the loaded clip to `name`, taking its sidecar still along, and
+    /// leave the app on the renamed clip — the grid intact where it can be, and
+    /// playback held where it was. Returns why it was refused, for the dialog to
+    /// show under the field; `Ok` means the dialog is done.
+    ///
+    /// The name is checked over before anything is stopped, because the checks
+    /// are what a typo hits: a collision or a dropped extension then costs
+    /// nothing and leaves the clip exactly as it was. Only a name that passes is
+    /// worth tearing the readers down for — Windows refuses to rename a file
+    /// that anything holds open, which is the same reason
+    /// [`delete_current`](Self::delete_current) stops all three of them.
+    fn commit_rename(&mut self, ctx: &egui::Context, name: &str) -> Result<(), String> {
+        let Some(l) = &self.loaded else { return Ok(()) };
+        let path = l.path.clone();
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("The name cannot be empty.".to_owned());
+        }
+        // A name, not a path: this renames a clip where it lies, and a separator
+        // would move it somewhere else entirely.
+        if name.contains(['/', '\\']) {
+            return Err("The name cannot contain \\ or /.".to_owned());
+        }
+        let new_path = path.with_file_name(name);
+        if new_path == path {
+            return Ok(());
+        }
+        // A clip renamed out of `VIDEO_EXTS` would still be the one on screen,
+        // but the folder scan behind prev/next would no longer list it — so it
+        // could be neither stepped away from nor found again. Refused rather
+        // than left in a view with no way on.
+        if !is_video(&new_path) {
+            return Err(format!(
+                "The name has to keep a video extension ({}).",
+                VIDEO_EXTS.join(", ")
+            ));
+        }
+        if is_taken(&new_path, &path) {
+            return Err(format!("\"{name}\" is already in this folder."));
+        }
+
+        // Nothing of ours may hold the clip open, or Windows turns the rename
+        // down the same way it turns a delete down: the decoder for as long as
+        // playback lasts, the grid worker until its pass ends, and a still until
+        // its frame is written.
+        let playing_at = self.player.as_ref().map(|p| p.position_s);
+        self.stop_playback_and_wait();
+        let was_reading = self.stop_extraction_and_wait();
+        self.finish_save_and_wait(ctx);
+
+        let result = std::fs::rename(&path, &new_path);
+        // Whichever way it went, the readers that were stopped go back on the
+        // clip that is actually there now — the new name if the rename landed,
+        // the old one if it didn't.
+        let clip = if result.is_ok() { &new_path } else { &path };
+        if was_reading {
+            // The partial grid went with the worker, so this one starts over.
+            // The alternative was leaving the user on an error with no grid,
+            // which is what prev/next and DEL work from.
+            self.loaded = Some(spawn_extraction(ctx, clip.clone()));
+        } else if let Some(l) = &mut self.loaded {
+            // A finished grid is simply relabelled: the thumbnails are of frames
+            // the rename didn't touch, so re-reading the clip would spend the
+            // disk to arrive back where it already is.
+            l.path = clip.clone();
+        }
+        if let Some(pos) = playing_at {
+            self.play(ctx, pos);
+            // Land back on the exact frame that was showing and hold there: the
+            // dialog paused it, and `play` would otherwise run on from the
+            // keyframe before it.
+            if let Some(p) = &mut self.player {
+                p.paused = true;
+            }
+            self.send_cmd(media::PlayCommand::Scrub(pos));
+        }
+
+        if let Err(e) = result {
+            log::error!(
+                "failed to rename {} to {}: {e}",
+                path.display(),
+                new_path.display()
+            );
+            return Err(format!("Could not rename it: {e}"));
+        }
+        log::info!("renamed {} to {}", path.display(), new_path.display());
+
+        // The sidecar still written by `save_still` is named after the clip, so
+        // it follows the clip — the same reason a delete bins it. The clip is
+        // already renamed by here, so a still that won't move is reported and
+        // lived with rather than rolled back.
+        let still = path.with_extension("jpg");
+        if still.exists() {
+            let new_still = new_path.with_extension("jpg");
+            if let Err(e) = std::fs::rename(&still, &new_still) {
+                log::error!("failed to rename sidecar {}: {e}", still.display());
+                self.error = Some(format!(
+                    "Renamed the clip, but its still \"{}\" stayed — it may still be in use.",
+                    display_name(&still)
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Ask for a full-resolution JPEG of the frame at `time_s`, written next to
@@ -1550,7 +1816,11 @@ impl eframe::App for App {
         }
         // Open a dropped file (last video dropped wins). Anything else is
         // ignored: extraction finds no video stream, so the app would sit on a
-        // named-but-empty grid where every key does nothing.
+        // named-but-empty grid where every key does nothing. A drop is ignored
+        // outright while the rename dialog is up — it arrives from the OS rather
+        // than through the modal's backdrop, and swapping the clip out from
+        // under an open dialog would have it rename the newcomer to the name of
+        // the clip that was there when it opened.
         if let Some(path) = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1559,7 +1829,9 @@ impl eframe::App for App {
                 .filter(|p| is_video(p))
                 .last()
         }) {
-            self.open(&ctx, path);
+            if self.rename.is_none() {
+                self.open(&ctx, path);
+            }
         }
 
         self.poll(&ctx);
@@ -1567,7 +1839,10 @@ impl eframe::App for App {
         self.sync_title(&ctx);
         self.look_ahead(&ctx);
         // Before the views, so the early returns below cannot skip it; it draws
-        // over them from its own layer regardless.
+        // over them from its own layer regardless. The dialog goes first of the
+        // three: it takes the keyboard for the rest of the frame, and the help
+        // plate's H is one of the keys a name being typed must not reach.
+        self.rename_ui(&ctx);
         self.flash_ui(&ctx);
         self.help_ui(&ctx);
 
@@ -1580,6 +1855,13 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
             let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+        }
+
+        // "N" opens the rename dialog. Also above the early return, so the one
+        // handler serves the grid and playback alike; a dialog already up has
+        // taken the keyboard by here, so this cannot reopen on the "n" of a name.
+        if self.loaded.is_some() && ctx.input(|i| i.key_pressed(egui::Key::N)) {
+            self.begin_rename();
         }
 
         // While a clip is playing it fills the window; the grid and its keys are
@@ -2448,5 +2730,168 @@ mod tests {
         // A file dropped into the folder mid-session is seen on the next scan.
         let b = touch(dir.path(), "b.mp4");
         assert_eq!(neighbor_of(&a, 1), Some(b));
+    }
+
+    /// Where the rename dialog opens its caret — the whole point of the key.
+    #[test]
+    fn the_caret_opens_before_the_extension() {
+        assert_eq!(caret_before_ext("clip.mp4"), 4);
+        // The last dot: everything ahead of it is the name being edited.
+        assert_eq!(caret_before_ext("a.b.mp4"), 3);
+        // Nothing to stay clear of, so the end.
+        assert_eq!(caret_before_ext("clip"), 4);
+        // Characters, not bytes. A byte offset would put the caret eight
+        // characters along a name that is only four long.
+        assert_eq!(caret_before_ext("клип.mp4"), 4);
+    }
+
+    /// An `App` sitting on a finished grid for a real file, which is what
+    /// `commit_rename` needs: nothing holds the clip open, so it renames it
+    /// where it lies.
+    fn app_on(clip: &Path) -> App {
+        let mut app = App::new(None);
+        app.loaded = Some(fake_loaded(
+            &clip.to_string_lossy(),
+            5,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        app
+    }
+
+    /// A name already in the folder is refused rather than renamed onto.
+    /// `fs::rename` overwrites its destination without a word, so without the
+    /// check a typo would bin the clip that name belongs to.
+    #[test]
+    fn renaming_onto_a_sibling_is_refused_and_leaves_it_alone() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        let b = dir.path().join("b.mp4");
+        fs::write(&b, b"keep me").unwrap();
+        let mut app = app_on(&a);
+
+        assert!(
+            app.commit_rename(&ctx, "b.mp4").is_err(),
+            "renaming onto a sibling should be refused"
+        );
+        assert_eq!(fs::read(&b).unwrap(), b"keep me", "the sibling was overwritten");
+        assert!(a.exists(), "the clip should still be where it was");
+    }
+
+    /// The ordinary case: the file moves and the grid follows it, unread.
+    #[test]
+    fn renaming_moves_the_clip_and_keeps_the_grid() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(None);
+        app.loaded = Some(fake_loaded(&a.to_string_lossy(), 5, true, Arc::clone(&cancel)));
+
+        app.commit_rename(&ctx, "b.mp4").expect("the rename should land");
+
+        let b = dir.path().join("b.mp4");
+        assert!(b.exists() && !a.exists(), "the clip should have moved");
+        let l = app.loaded.as_ref().expect("the clip should still be loaded");
+        assert_eq!(l.path, b, "the grid should follow the clip's new name");
+        assert_eq!(l.cells.len(), 5, "a finished grid should not be re-read");
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "the grid was dropped instead of relabelled"
+        );
+    }
+
+    /// Enter on a name left as it was closes the dialog and does nothing else.
+    #[test]
+    fn renaming_to_the_same_name_is_a_no_op() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        let mut app = app_on(&a);
+
+        app.commit_rename(&ctx, "a.mp4").expect("an unchanged name should just close");
+
+        assert!(a.exists(), "the clip should be untouched");
+    }
+
+    /// Fixing a clip's case is a rename, not a collision: Windows matches names
+    /// case-insensitively, so the file "already there" is the clip itself.
+    #[test]
+    fn a_clip_can_be_renamed_to_fix_its_case() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "clip.mp4");
+        let mut app = app_on(&a);
+
+        app.commit_rename(&ctx, "Clip.mp4")
+            .expect("a change of case should be allowed");
+
+        let listed: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(listed, ["Clip.mp4"], "the clip should have taken the new case");
+    }
+
+    /// The still saved beside a clip is named after it, so it goes where the
+    /// clip goes — the same reason a delete bins it.
+    #[test]
+    fn renaming_takes_the_sidecar_still_along() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        touch(dir.path(), "a.jpg");
+        let mut app = app_on(&a);
+
+        app.commit_rename(&ctx, "b.mp4").expect("the rename should land");
+
+        assert!(dir.path().join("b.jpg").exists(), "the still should have followed");
+        assert!(!dir.path().join("a.jpg").exists(), "the old still should be gone");
+        assert!(app.error.is_none(), "a still that moved should be reported as nothing");
+    }
+
+    /// Changing only the extension leaves the still's own name unchanged, so the
+    /// sidecar is renamed onto itself. That has to pass quietly: reporting it
+    /// would put a red "the still stayed" where the grid should be, over a still
+    /// that is exactly where it belongs.
+    #[test]
+    fn renaming_only_the_extension_leaves_the_still_alone() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        touch(dir.path(), "a.jpg");
+        let mut app = app_on(&a);
+
+        app.commit_rename(&ctx, "a.mkv").expect("the rename should land");
+
+        assert!(dir.path().join("a.mkv").exists(), "the clip should have moved");
+        assert!(dir.path().join("a.jpg").exists(), "the still should still be there");
+        assert!(app.error.is_none(), "a still that never had to move was reported as stuck");
+    }
+
+    /// Names that are not names, or that would strand the view on a clip the
+    /// folder scan no longer lists. Each is turned down before anything is
+    /// stopped, so the clip is left exactly as it was.
+    #[test]
+    fn malformed_names_are_refused() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        let mut app = app_on(&a);
+
+        assert!(
+            app.commit_rename(&ctx, "a.txt").is_err(),
+            "a name that drops the video extension should be refused"
+        );
+        assert!(
+            app.commit_rename(&ctx, "   ").is_err(),
+            "an empty name should be refused"
+        );
+        assert!(
+            app.commit_rename(&ctx, "sub\\a.mp4").is_err(),
+            "a path rather than a name should be refused"
+        );
+        assert!(a.exists(), "a refused name should leave the clip where it is");
     }
 }
