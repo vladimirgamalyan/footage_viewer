@@ -1,13 +1,18 @@
 //! footage_viewer — open a clip and see a grid of frames sampled across it.
 //!
 //! Extraction runs on a background thread and streams thumbnails back; the grid
-//! fills in progressively so the window never blocks on open.
+//! fills in progressively so the window never blocks on open. Grids of clips
+//! just visited are kept, and the next sibling is read ahead while the current
+//! one is studied, so stepping through a folder rarely waits on the disk.
 
 // In release, build as a Windows GUI app so launching from Explorer doesn't flash a console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 
 use eframe::egui;
@@ -27,6 +32,19 @@ const GRID_COLS_MAX: usize = 12;
 /// Long side of decoded playback frames. Caps per-frame scaling and texture
 /// upload cost; large enough for the video to fill a typical window crisply.
 const PLAYBACK_LONG: u32 = 1600;
+
+/// Total thumbnails the recently-viewed grids may hold before the oldest is
+/// evicted. Stepping back to a clip just visited then costs nothing instead of
+/// re-reading it — which on the external HDD the target archive lives on is
+/// seconds, not milliseconds.
+///
+/// The budget counts thumbnails rather than clips because a grid holds roughly
+/// one per second of footage: a fixed clip count would mean ~25 thumbnails each
+/// for the 10-23 s clips this tool targets, but thousands for a long recording.
+/// At ~0.23 MB per 320-wide RGBA thumbnail this is ~46 MB of texture memory, and
+/// it holds about eight of the target clips. A single grid larger than the whole
+/// budget is simply never cached, which is the right way to give up on it.
+const RECENT_MAX_THUMBS: usize = 200;
 
 /// Smallest cursor move (in media seconds) that triggers a new live seek while
 /// dragging. Holding within this of the current position keeps the frozen frame
@@ -176,6 +194,25 @@ struct Loaded {
     rx: Receiver<Msg>,
     /// Selected grid cell, moved with AWSD; Enter plays it.
     cursor: usize,
+    /// Stops the extraction worker; raised by `Drop`.
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Loaded {
+    /// Stop extracting a clip the moment it is dropped — which is the moment
+    /// nothing can display it any more (navigating away, a failure, deleting it).
+    ///
+    /// The worker does not notice on its own: it ignores the send error from the
+    /// closed channel and would read the clip to the end regardless. On a local
+    /// disk that is invisible, but the target archive lives on an external HDD
+    /// where each abandoned pass holds the single head for seconds — hold a key
+    /// to skip through a folder and every clip passed leaves a thread fighting
+    /// the one clip the user is actually waiting for.
+    ///
+    /// Done here rather than at each call site so it cannot be forgotten by one.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -184,6 +221,16 @@ struct App {
     loaded: Option<Loaded>,
     /// Some while a clip is playing back over the grid.
     player: Option<Player>,
+    /// Grids of clips viewed earlier, newest first, so stepping back to one is
+    /// instant. Bounded by [`RECENT_MAX_THUMBS`]; holds only finished grids.
+    recent: VecDeque<Loaded>,
+    /// The next sibling's grid, being read in the background so stepping forward
+    /// is instant. Its thumbnails stay in the channel until it is opened — only
+    /// then does anyone poll them. See [`look_ahead`](Self::look_ahead).
+    prefetch: Option<Loaded>,
+    /// Whether the current clip has had its look-ahead decision made, so the
+    /// folder is scanned once per clip rather than once per repaint.
+    looked_ahead: bool,
     /// Set while a live seek fired from the scrubber has not produced its frame
     /// yet, so a drag never has more than one seek in flight (see [`seek_bar_ui`]).
     scrub_in_flight: bool,
@@ -217,49 +264,103 @@ impl App {
         neighbor_of(&self.loaded.as_ref()?.path, delta)
     }
 
-    /// Kick off background extraction; returns immediately.
+    /// Set the outgoing clip aside in [`recent`](Self::recent) so stepping back to
+    /// it later is free, evicting the oldest grids to stay inside the thumbnail
+    /// budget. Leaves `self.loaded` empty.
+    ///
+    /// Only a finished grid is kept. An unfinished one is dropped instead — which
+    /// cancels it — because parking it would leave its worker reading a clip
+    /// nobody is looking at, exactly the stolen disk head that cancellation
+    /// exists to prevent.
+    fn park_current(&mut self) {
+        let Some(l) = self.loaded.take() else { return };
+        if !l.done {
+            return;
+        }
+        self.recent.push_front(l);
+
+        let mut total: usize = self.recent.iter().map(|l| l.cells.len()).sum();
+        while total > RECENT_MAX_THUMBS {
+            match self.recent.pop_back() {
+                Some(evicted) => total -= evicted.cells.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// Take `path`'s grid out of the recent cache, if it is still there.
+    fn take_recent(&mut self, path: &Path) -> Option<Loaded> {
+        let i = self.recent.iter().position(|l| l.path == path)?;
+        self.recent.remove(i)
+    }
+
+    /// Show `path`'s grid, without ever re-reading a clip we already have: from
+    /// the recent cache, or from a prefetch already reading it, else by kicking
+    /// off a fresh extraction. Returns immediately in every case.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         log::info!("opening clip: {}", path.display());
         self.error = None;
         // Leaving any current clip: stop playback and fall back to the grid.
         self.player = None;
+        // A new clip deserves its own look ahead.
+        self.looked_ahead = false;
 
-        let (tx, rx) = mpsc::channel();
-        let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
-        let (ctx_meta, ctx_thumb, ctx_end) = (ctx.clone(), ctx.clone(), ctx.clone());
-        let worker_path = path.clone();
+        // Set the outgoing grid aside before looking, so re-opening the very clip
+        // being left still finds it.
+        self.park_current();
 
-        thread::spawn(move || {
-            let result = media::extract_grid_streaming(
-                &worker_path,
-                THUMB_SPACING_S,
-                THUMB_LONG,
-                move |m| {
-                    let _ = tx_meta.send(Msg::Meta(m));
-                    ctx_meta.request_repaint();
-                },
-                move |i, t| {
-                    let _ = tx_thumb.send(Msg::Thumb(i, t));
-                    ctx_thumb.request_repaint();
-                },
-            );
-            let _ = match result {
-                Ok(()) => tx.send(Msg::Done),
-                Err(e) => tx.send(Msg::Err(format!("{e:#}"))),
-            };
-            ctx_end.request_repaint();
-        });
+        // Claim a prefetch already reading this clip; one reading anything else is
+        // now pointless, and `filter` drops it here — which cancels it and hands
+        // the disk back to the clip being opened.
+        let prefetched = self.prefetch.take().filter(|l| l.path == path);
 
-        self.loaded = Some(Loaded {
-            path,
-            duration_s: 0.0,
-            aspect: 9.0 / 16.0,
-            cells: Vec::new(),
-            ready: 0,
-            done: false,
-            rx,
-            cursor: 0,
-        });
+        if let Some(l) = self.take_recent(&path) {
+            // Logged so a tester's log doesn't show an "opening clip" with no
+            // grid timing after it and read as a stall.
+            log::info!("grid served from cache: {}", path.display());
+            self.loaded = Some(l);
+            return;
+        }
+        if let Some(l) = prefetched {
+            log::info!("grid taken over from prefetch: {}", path.display());
+            self.loaded = Some(l);
+            return;
+        }
+
+        self.loaded = Some(spawn_extraction(ctx, path));
+    }
+
+    /// Read the next sibling's grid in the background while the user studies the
+    /// current one, so stepping forward — the way a folder actually gets worked
+    /// through — finds it already read. Forward only: that is the dominant
+    /// motion, and stepping back is already free via the recent cache.
+    ///
+    /// Reading ahead must never compete with the foreground, because the archive
+    /// this tool targets lives on an external HDD with a single head. So it waits
+    /// for the current grid to finish (the clip the user is actually waiting for
+    /// gets the disk to itself) and never starts while a clip is playing (its
+    /// seeks must not queue behind a read nobody asked for). Once started it is
+    /// left to finish: cancelling it on every play would restart the read from
+    /// zero each time the user came back, so it would churn the disk forever and
+    /// never deliver a grid.
+    fn look_ahead(&mut self, ctx: &egui::Context) {
+        // Decided once per clip, not once per repaint: `neighbor` re-scans the
+        // folder, which is far too much to redo on every frame.
+        if self.looked_ahead || self.player.is_some() {
+            return;
+        }
+        let Some(l) = &self.loaded else { return };
+        if !l.done {
+            return;
+        }
+        self.looked_ahead = true;
+
+        let Some(next) = self.neighbor(1) else { return };
+        if self.recent.iter().any(|l| l.path == next) {
+            return;
+        }
+        log::info!("reading ahead: {}", next.display());
+        self.prefetch = Some(spawn_extraction(ctx, next));
     }
 
     /// Reflect the loaded clip's path in the window title, resending the command
@@ -442,8 +543,9 @@ impl App {
     /// and return the sibling to open next — the following clip, or the previous
     /// one if the deleted clip was the last in its folder. Returns `None` when
     /// nothing is loaded, the delete failed (reason recorded in `self.error`), or
-    /// the folder is now empty; in the empty case the loaded/playing state is
-    /// cleared here so the caller can simply return to the empty view.
+    /// the folder is now empty. On a successful delete the binned clip's grid is
+    /// dropped, and in the empty case playback stops too, so the caller can
+    /// simply return to the empty view.
     fn delete_current(&mut self) -> Option<PathBuf> {
         let path = self.loaded.as_ref()?.path.clone();
         // Resolve the neighbor before deleting, while the clip still lists.
@@ -454,6 +556,10 @@ impl App {
             return None;
         }
         log::info!("deleted clip {}", path.display());
+        // Drop the binned clip's grid rather than let the next `open` park it in
+        // the recent cache: it would hold texture memory for a file that is gone
+        // and that prev/next can never reach again, since they re-scan the folder.
+        self.loaded = None;
         // Also bin the sidecar still saved by save_still (`<clip-stem>.jpg`), if any.
         let still = path.with_extension("jpg");
         if still.exists() {
@@ -465,7 +571,6 @@ impl App {
         if target.is_none() {
             // Deleted the only clip in the folder — nothing left to show.
             self.player = None;
-            self.loaded = None;
         }
         target
     }
@@ -702,6 +807,53 @@ fn seek_bar_ui(
     cmd
 }
 
+/// Start reading `path`'s grid on a background thread, returning the clip state
+/// its thumbnails stream into. The thumbnails wait in the channel until someone
+/// polls them, so this is equally the way a clip is opened and the way one is
+/// read ahead — the difference is only which slot holds the result.
+fn spawn_extraction(ctx: &egui::Context, path: PathBuf) -> Loaded {
+    let (tx, rx) = mpsc::channel();
+    let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
+    let (ctx_meta, ctx_thumb, ctx_end) = (ctx.clone(), ctx.clone(), ctx.clone());
+    let worker_path = path.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+
+    thread::spawn(move || {
+        let result = media::extract_grid_streaming(
+            &worker_path,
+            THUMB_SPACING_S,
+            THUMB_LONG,
+            &worker_cancel,
+            move |m| {
+                let _ = tx_meta.send(Msg::Meta(m));
+                ctx_meta.request_repaint();
+            },
+            move |i, t| {
+                let _ = tx_thumb.send(Msg::Thumb(i, t));
+                ctx_thumb.request_repaint();
+            },
+        );
+        let _ = match result {
+            Ok(()) => tx.send(Msg::Done),
+            Err(e) => tx.send(Msg::Err(format!("{e:#}"))),
+        };
+        ctx_end.request_repaint();
+    });
+
+    Loaded {
+        path,
+        duration_s: 0.0,
+        aspect: 9.0 / 16.0,
+        cells: Vec::new(),
+        ready: 0,
+        done: false,
+        rx,
+        cursor: 0,
+        cancel,
+    }
+}
+
 /// New cursor index after moving `(dx, dy)` cells within a `cols`-wide grid of
 /// `n` cells. Clamps at the edges (no wrap) and to the last, possibly partial,
 /// row so the cursor never lands past the streamed thumbnails.
@@ -743,6 +895,7 @@ impl eframe::App for App {
 
         self.poll(&ctx);
         self.sync_title(&ctx);
+        self.look_ahead(&ctx);
 
         // While a clip is playing it fills the window; the grid and its keys are
         // hidden until playback ends or Escape returns here.
@@ -946,6 +1099,281 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, b"x").unwrap();
         p
+    }
+
+    /// A stand-in grid. `Cell::Pending` needs no texture, so the cache's
+    /// bookkeeping is testable without a live egui context.
+    fn fake_loaded(path: &str, thumbs: usize, done: bool, cancel: Arc<AtomicBool>) -> Loaded {
+        let (_tx, rx) = mpsc::channel();
+        Loaded {
+            path: PathBuf::from(path),
+            duration_s: 0.0,
+            aspect: 1.0,
+            cells: (0..thumbs).map(|_| Cell::Pending).collect(),
+            ready: thumbs,
+            done,
+            rx,
+            cursor: 0,
+            cancel,
+        }
+    }
+
+    /// Dropping a clip stops its extraction worker. `media` honours the flag (it
+    /// has its own test for that); this pins the other half of the chain — that
+    /// the flag is actually raised when the UI lets a clip go.
+    #[test]
+    fn dropping_a_loaded_clip_cancels_its_extraction() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let loaded = fake_loaded("clip.mp4", 0, false, Arc::clone(&cancel));
+
+        assert!(!cancel.load(Ordering::Relaxed), "not cancelled while held");
+        drop(loaded);
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "dropping a clip left its worker reading the file"
+        );
+    }
+
+    /// A finished grid survives being stepped away from, so coming back to it
+    /// costs no re-read.
+    #[test]
+    fn a_finished_grid_comes_back_from_the_cache() {
+        let mut app = App::new(None);
+        app.loaded = Some(fake_loaded("a.mp4", 5, true, Arc::new(AtomicBool::new(false))));
+
+        app.park_current();
+        assert!(app.loaded.is_none(), "parking should empty the current slot");
+
+        let restored = app.take_recent(Path::new("a.mp4"));
+        assert!(restored.is_some(), "a finished grid should come back");
+        assert!(
+            app.take_recent(Path::new("a.mp4")).is_none(),
+            "taking a grid should remove it from the cache"
+        );
+    }
+
+    /// An unfinished grid is dropped rather than cached — and dropping it stops
+    /// its worker, so no reading continues for a clip nobody is looking at.
+    #[test]
+    fn an_unfinished_grid_is_cancelled_not_cached() {
+        let mut app = App::new(None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.loaded = Some(fake_loaded("half.mp4", 3, false, Arc::clone(&cancel)));
+
+        app.park_current();
+
+        assert!(app.recent.is_empty(), "an unfinished grid must not be cached");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "an unfinished grid left its worker reading"
+        );
+    }
+
+    /// The cache is bounded by thumbnails, not by clip count: enough grids evict
+    /// the oldest. A clip count would let long clips blow past any memory budget.
+    #[test]
+    fn the_cache_evicts_oldest_to_stay_within_the_thumbnail_budget() {
+        let mut app = App::new(None);
+        // 25 thumbs each, the size of a target 23 s clip; 20 clips overruns 200.
+        for i in 0..20 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            app.loaded = Some(fake_loaded(&format!("c{i}.mp4"), 25, true, cancel));
+            app.park_current();
+        }
+
+        let total: usize = app.recent.iter().map(|l| l.cells.len()).sum();
+        assert!(
+            total <= RECENT_MAX_THUMBS,
+            "cache holds {total} thumbs, over the {RECENT_MAX_THUMBS} budget"
+        );
+        assert!(
+            app.take_recent(Path::new("c19.mp4")).is_some(),
+            "the newest grid should still be cached"
+        );
+        assert!(
+            app.take_recent(Path::new("c0.mp4")).is_none(),
+            "the oldest grid should have been evicted"
+        );
+    }
+
+    /// `open` serves a cached grid instead of re-extracting it. Re-opening the
+    /// very clip being left is the sharp case: it only works because `open` parks
+    /// the outgoing grid *before* it looks in the cache.
+    #[test]
+    fn open_serves_a_cached_grid_instead_of_re_extracting() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.loaded = Some(fake_loaded("a.mp4", 5, true, Arc::clone(&cancel)));
+
+        app.open(&ctx, PathBuf::from("a.mp4"));
+
+        let l = app.loaded.as_ref().expect("a grid should be loaded");
+        assert_eq!(l.path, PathBuf::from("a.mp4"));
+        // A fresh extraction would have started empty and unfinished; only the
+        // cached grid comes back already done and with its thumbnails.
+        assert!(l.done, "open re-extracted a clip it already had cached");
+        assert_eq!(l.cells.len(), 5, "cached thumbnails should have come back");
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "a cached grid was dropped instead of reused"
+        );
+    }
+
+    /// A stand-in player. Nothing reads its channels; it only marks the app as
+    /// playing.
+    fn fake_player() -> Player {
+        let (cmds, _cmd_rx) = mpsc::channel();
+        let (_frame_tx, rx) = mpsc::channel();
+        Player {
+            cmds,
+            rx,
+            tex: None,
+            frame_size: egui::Vec2::ZERO,
+            position_s: 0.0,
+            paused: false,
+            scrub: None,
+        }
+    }
+
+    /// An app looking at a finished grid of `a.mp4`, with `b.mp4` next to it —
+    /// the state a look-ahead acts on. Returns the folder, which must outlive the
+    /// app, and both paths.
+    fn app_on_a_folder() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = touch(dir.path(), "a.mp4");
+        let b = touch(dir.path(), "b.mp4");
+        let mut app = App::new(None);
+        app.loaded = Some(fake_loaded(
+            a.to_str().unwrap(),
+            5,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        (dir, app, a, b)
+    }
+
+    /// With the grid finished and nothing playing, the next sibling starts being
+    /// read — so stepping forward finds it already done.
+    #[test]
+    fn look_ahead_starts_reading_the_next_sibling() {
+        let (_dir, mut app, _a, b) = app_on_a_folder();
+
+        app.look_ahead(&egui::Context::default());
+
+        let p = app.prefetch.as_ref().expect("next sibling should be reading");
+        assert_eq!(p.path, b);
+    }
+
+    /// Nothing is read ahead while a clip plays: the archive's HDD has one head,
+    /// and the seeks of the clip being watched must not queue behind a read
+    /// nobody asked for.
+    #[test]
+    fn look_ahead_does_not_start_while_playing() {
+        let (_dir, mut app, _a, _b) = app_on_a_folder();
+        app.player = Some(fake_player());
+
+        app.look_ahead(&egui::Context::default());
+
+        assert!(app.prefetch.is_none(), "read ahead while a clip was playing");
+    }
+
+    /// Nothing is read ahead until the current grid is finished: the clip the
+    /// user is waiting for gets the disk to itself first.
+    #[test]
+    fn look_ahead_waits_for_the_current_grid_to_finish() {
+        let (_dir, mut app, a, _b) = app_on_a_folder();
+        app.loaded = Some(fake_loaded(
+            a.to_str().unwrap(),
+            2,
+            false, // still being read
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        app.look_ahead(&egui::Context::default());
+
+        assert!(
+            app.prefetch.is_none(),
+            "read ahead while the current grid was still being read"
+        );
+    }
+
+    /// A clip already in the recent cache is not read a second time.
+    #[test]
+    fn look_ahead_skips_a_clip_already_cached() {
+        let (_dir, mut app, _a, b) = app_on_a_folder();
+        app.recent.push_front(fake_loaded(
+            b.to_str().unwrap(),
+            3,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        app.look_ahead(&egui::Context::default());
+
+        assert!(app.prefetch.is_none(), "read ahead a clip already cached");
+    }
+
+    /// Opening the clip being read ahead takes that read over rather than
+    /// restarting it — whatever it has already pulled off the disk is kept.
+    #[test]
+    fn open_takes_over_a_matching_prefetch() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.prefetch = Some(fake_loaded("b.mp4", 0, false, Arc::clone(&cancel)));
+
+        app.open(&ctx, PathBuf::from("b.mp4"));
+
+        assert!(app.prefetch.is_none(), "the prefetch slot should be empty");
+        assert_eq!(app.loaded.as_ref().expect("a grid").path, PathBuf::from("b.mp4"));
+        // A fresh extraction would have dropped the prefetch, cancelling it.
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "the prefetch was restarted instead of taken over"
+        );
+    }
+
+    /// Opening some other clip drops the read-ahead, which cancels it and hands
+    /// the disk straight back to the clip the user asked for.
+    #[test]
+    fn open_cancels_a_prefetch_of_another_clip() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.prefetch = Some(fake_loaded("b.mp4", 0, false, Arc::clone(&cancel)));
+        // Park a.mp4 so opening it hits the cache and spawns no real extraction.
+        app.loaded = Some(fake_loaded("a.mp4", 5, true, Arc::new(AtomicBool::new(false))));
+        app.park_current();
+
+        app.open(&ctx, PathBuf::from("a.mp4"));
+
+        assert!(app.prefetch.is_none(), "the prefetch slot should be empty");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "a read-ahead for a clip we left was not cancelled"
+        );
+    }
+
+    /// A grid bigger than the whole budget is never cached: it would evict
+    /// everything else and still overrun.
+    #[test]
+    fn a_grid_larger_than_the_budget_is_not_cached() {
+        let mut app = App::new(None);
+        let thumbs = RECENT_MAX_THUMBS + 1;
+        app.loaded = Some(fake_loaded(
+            "long.mp4",
+            thumbs,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        app.park_current();
+
+        assert!(
+            app.recent.is_empty(),
+            "a grid over the budget should not be cached"
+        );
     }
 
     #[test]

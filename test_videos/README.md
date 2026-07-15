@@ -14,9 +14,11 @@ All are H.264 / yuv420p, generated with the ffmpeg CLI — run `./generate.sh`
 | `mandelbrot_15s_1080p.mp4` | 1920×1080 | 15 s | Continuous fractal zoom + 1080p decode cost. |
 | `counter_25s_vertical.mp4` | 1080×1920 | 25 s | Vertical aspect + longer duration; testsrc counter for ground-truth times. |
 | `camera_8s_4k.mp4` | 3840×2160 | 8 s | 4K at 25 fps with a forced ~0.5 s GOP — stands in for the camera archive the tool targets. The only clip that takes the hardware decode path, and the only one whose seeks decode a short GOP. |
+| `allintra_4s_240p.mp4` | 320×240 | 4 s | Every frame a keyframe. The only clip with more keyframes than the grid decoder has frame threads, so it is the only one whose thumbnails arrive *while* the file is still being read — which is what makes a cancelled extraction tell apart from a finished one. |
 
 The first four are 30 fps with x264's default 250-frame (~8 s) GOP; `camera_8s_4k.mp4`
-is 25 fps with `-g 12`, matching the target footage's ~0.5 s keyframe spacing.
+is 25 fps with `-g 12`, matching the target footage's ~0.5 s keyframe spacing;
+`allintra_4s_240p.mp4` is 30 fps with `-g 1`.
 
 These are build artifacts, not source — regenerate with the script rather than
 committing them to version control.

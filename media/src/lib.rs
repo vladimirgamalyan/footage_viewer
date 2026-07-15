@@ -8,6 +8,7 @@
 //! seek approach.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -235,6 +236,73 @@ struct SeekProfile {
     decode_ms: f64,
 }
 
+/// Timing and byte counts for one grid pass, accumulated as it runs and logged
+/// when it finishes.
+///
+/// Which cost dominates depends on where the footage lives, and only a log from
+/// the machine holding it can say. On a warm local disk the pass is decode-bound
+/// (measured on an 8 s 4K clip: 9 ms of demux against 62 ms of decode), but the
+/// archive this tool targets sits on a slow external HDD, where reading the file
+/// may well dwarf everything else. So the line reports the split, the read
+/// throughput behind it, and what share of the stream the keyframes are — that
+/// last one bounds what a seek-per-keyframe read could save, since this pass
+/// demuxes every packet only to drop all but the keyframes.
+struct GridProfile {
+    start: Instant,
+    open_ms: f64,
+    setup_ms: f64,
+    demux_ms: f64,
+    decode_ms: f64,
+    convert_ms: f64,
+    bytes: u64,
+    key_bytes: u64,
+    keyframes: u32,
+}
+
+impl GridProfile {
+    /// Open a profile for a pass that began at `start`, with the file already
+    /// opened and probed (so that cost is known).
+    fn new(start: Instant) -> Self {
+        Self {
+            start,
+            open_ms: millis(start.elapsed()),
+            setup_ms: 0.0,
+            demux_ms: 0.0,
+            decode_ms: 0.0,
+            convert_ms: 0.0,
+            bytes: 0,
+            key_bytes: 0,
+            keyframes: 0,
+        }
+    }
+
+    /// Report the pass. `cancelled` distinguishes a pass that stopped early from
+    /// a complete one, so a partial `kept` count doesn't read as a finished grid.
+    fn log(&self, kept: usize, cancelled: bool) {
+        let mb = self.bytes as f64 / 1e6;
+        let read_mb_s = if self.demux_ms > 0.0 {
+            mb / (self.demux_ms / 1000.0)
+        } else {
+            0.0
+        };
+        log::info!(
+            "grid {}: kept {kept}/{} keyframes | total {:.0}ms | open {:.0}ms | setup {:.0}ms | \
+             demux {:.0}ms ({mb:.1} MB, {read_mb_s:.0} MB/s) | decode {:.0}ms | convert {:.0}ms | \
+             keyframes {:.1} MB ({:.0}% of stream)",
+            if cancelled { "cancelled" } else { "done" },
+            self.keyframes,
+            millis(self.start.elapsed()),
+            self.open_ms,
+            self.setup_ms,
+            self.demux_ms,
+            self.decode_ms,
+            self.convert_ms,
+            self.key_bytes as f64 / 1e6,
+            100.0 * self.key_bytes as f64 / self.bytes.max(1) as f64,
+        );
+    }
+}
+
 /// Clip metadata, reported once before any thumbnail.
 pub struct GridMeta {
     pub duration_s: f64,
@@ -310,14 +378,24 @@ impl KeyframeSampler {
 /// frame in order (index `0, 1, 2, …`) as it becomes ready — the total count is
 /// not known up front. Thumbnails fit into a box whose long side is
 /// `thumb_long_side`, preserving aspect.
+///
+/// Setting `cancel` abandons the pass, which then returns `Ok(())` having emitted
+/// only the thumbnails produced so far. It is read once per demuxed packet,
+/// because reading the file — not decoding it — is what a caller needs stopped:
+/// this pass demuxes the clip end to end, and on the external HDD the target
+/// archive lives on that is seconds of head time, which a worker nobody listens
+/// to would otherwise steal from the clip the user is waiting for.
 pub fn extract_grid_streaming(
     path: &Path,
     spacing_s: f64,
     thumb_long_side: u32,
+    cancel: &AtomicBool,
     mut on_meta: impl FnMut(GridMeta),
     mut on_thumb: impl FnMut(usize, Thumbnail),
 ) -> anyhow::Result<()> {
+    let t0 = Instant::now();
     let mut ictx = input(path)?;
+    let mut profile = GridProfile::new(t0);
 
     let stream = ictx
         .streams()
@@ -356,6 +434,9 @@ pub fn extract_grid_streaming(
         }
     }
     let mut decoder = decoder_ctx.decoder().video()?;
+    // Opening the decoder also opens the shared GPU device on the first clip of a
+    // session (~100 ms), so this is reported apart from the decode itself.
+    profile.setup_ms = millis(t0.elapsed()) - profile.open_ms;
     let (out_w, out_h) = thumb_size(src_w, src_h, thumb_long_side);
 
     // Built on the first thumbnail, not here: with a hardware decoder the frames
@@ -373,15 +454,31 @@ pub fn extract_grid_streaming(
     let mut next_index = 0usize;
     let mut sampler = KeyframeSampler::new(spacing_s);
 
-    for (s, packet) in ictx.packets() {
+    // Advance the packet iterator by hand rather than with `for`, so the time the
+    // demuxer spends reading the file is measured apart from the decode it feeds.
+    let mut packets = ictx.packets();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            profile.log(next_index, true);
+            return Ok(());
+        }
+        let read_start = Instant::now();
+        let next = packets.next();
+        profile.demux_ms += millis(read_start.elapsed());
+        let Some((s, packet)) = next else { break };
         if s.index() != stream_index {
             continue;
         }
+        profile.bytes += packet.size() as u64;
         // Send only keyframe packets; everything between them is skipped entirely.
         if !packet.is_key() {
             continue;
         }
+        profile.key_bytes += packet.size() as u64;
+        profile.keyframes += 1;
+        let decode_start = Instant::now();
         decoder.send_packet(&packet).ok();
+        profile.decode_ms += millis(decode_start.elapsed());
         drain(
             &mut decoder,
             &mut scaler,
@@ -394,6 +491,7 @@ pub fn extract_grid_streaming(
             &mut sampler,
             &mut next_index,
             &mut on_thumb,
+            &mut profile,
         )?;
     }
 
@@ -411,8 +509,10 @@ pub fn extract_grid_streaming(
         &mut sampler,
         &mut next_index,
         &mut on_thumb,
+        &mut profile,
     )?;
 
+    profile.log(next_index, false);
     Ok(())
 }
 
@@ -432,14 +532,19 @@ fn drain(
     sampler: &mut KeyframeSampler,
     next_index: &mut usize,
     on_thumb: &mut impl FnMut(usize, Thumbnail),
+    profile: &mut GridProfile,
 ) -> anyhow::Result<()> {
     loop {
         let mut frame = Video::empty();
-        if decoder.receive_frame(&mut frame).is_err() {
+        let receive_start = Instant::now();
+        let received = decoder.receive_frame(&mut frame);
+        profile.decode_ms += millis(receive_start.elapsed());
+        if received.is_err() {
             break;
         }
         let time_s = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
         if sampler.keep(time_s) {
+            let convert_start = Instant::now();
             // Unlike playback, every decoded frame here becomes a thumbnail, so a
             // hardware decode downloads all of them rather than just one.
             let from_gpu = frame.format() == Pixel::D3D11;
@@ -469,6 +574,7 @@ fn drain(
                 }
             };
             let thumb = scale_thumb(s, &frame, out_w, out_h, time_s)?;
+            profile.convert_ms += millis(convert_start.elapsed());
             on_thumb(*next_index, thumb);
             *next_index += 1;
         }
@@ -490,6 +596,8 @@ pub fn extract_grid(path: &Path, spacing_s: f64, thumb_long_side: u32) -> anyhow
         path,
         spacing_s,
         thumb_long_side,
+        // Nothing to abandon: this wrapper only returns once the grid is whole.
+        &AtomicBool::new(false),
         |m| meta = Some(m),
         |_, t| thumbs.push(t),
     )?;
@@ -1131,6 +1239,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Setting the cancel flag mid-pass stops it early instead of reading the file
+    /// to the end. This is the whole point of the flag: on the external HDD the
+    /// target archive lives on, a pass nobody is listening to keeps the disk head
+    /// busy for seconds, so it must stop reading as soon as it is abandoned.
+    ///
+    /// Uses the all-intra fixture on purpose. Every other clip holds fewer
+    /// keyframes (11-25) than the grid decoder has frame threads, so none of their
+    /// thumbnails arrive until the file has been demuxed to the end — cancelling
+    /// on the first one would come too late to stop any reading at all, and the
+    /// pass would look uncancellable when it is not.
+    #[test]
+    fn cancel_stops_extraction_early() {
+        init().unwrap();
+        let path = test_video("allintra_4s_240p.mp4");
+        // Well under the fixture's 1/30 s keyframe interval, so every one is kept.
+        let spacing_s = 0.01;
+
+        // The whole grid, for reference — a cancelled pass must yield far less.
+        let full = extract_grid(&path, spacing_s, 320).unwrap().thumbs.len();
+        assert!(full > 100, "fixture should keep every frame, kept {full}");
+
+        // Abandon the pass the moment the first thumbnail lands.
+        let cancel = AtomicBool::new(false);
+        let mut kept = 0usize;
+        extract_grid_streaming(
+            &path,
+            spacing_s,
+            320,
+            &cancel,
+            |_| {},
+            |_, _| {
+                kept += 1;
+                cancel.store(true, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+
+        // In practice exactly 1: the flag is seen at the very next packet. The
+        // bound stays loose only to survive a machine whose frame-thread count
+        // lets a few more buffered frames drain out first.
+        assert!(
+            kept < full / 2,
+            "cancelled pass produced {kept} of {full} thumbs — it did not stop"
+        );
+    }
+
+    /// A pass cancelled before it starts reads nothing at all: the flag is checked
+    /// before the first packet, not only between thumbnails.
+    #[test]
+    fn cancel_before_the_first_packet_yields_nothing() {
+        init().unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut kept = 0usize;
+        let mut got_meta = false;
+        extract_grid_streaming(
+            &test_video("camera_8s_4k.mp4"),
+            1.0,
+            320,
+            &cancel,
+            |_| got_meta = true,
+            |_, _| kept += 1,
+        )
+        .unwrap();
+
+        // Metadata comes from the header, which is already read by then; only the
+        // decode pass is skipped.
+        assert!(got_meta, "metadata should still be reported");
+        assert_eq!(kept, 0, "a pre-cancelled pass produced thumbnails");
     }
 
     /// `save_frame_jpeg` writes a valid JPEG at full source resolution for the

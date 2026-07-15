@@ -9,13 +9,13 @@ FONT="C\\:/Windows/Fonts/arial.ttf"
 X264="-c:v libx264 -preset veryfast -pix_fmt yuv420p -movflags +faststart"
 TC="drawtext=fontfile='${FONT}':fontsize=56:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=12"
 
-echo "[1/5] hue_sweep_20s_720p.mp4 (continuous rainbow, 1280x720, 20s)"
+echo "[1/6] hue_sweep_20s_720p.mp4 (continuous rainbow, 1280x720, 20s)"
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -i "color=c=red:s=1280x720:r=30:d=20" \
   -vf "hue=h=360*t/20,${TC}:text='HUE  %{pts\\:hms}':x=(w-tw)/2:y=h-th-40" \
   ${X264} hue_sweep_20s_720p.mp4
 
-echo "[2/5] scenes_18s_720p.mp4 (6 hard-cut scenes x 3s, 1280x720, 18s)"
+echo "[2/6] scenes_18s_720p.mp4 (6 hard-cut scenes x 3s, 1280x720, 18s)"
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -t 3 -i "smptebars=s=1280x720:r=30" \
   -f lavfi -t 3 -i "rgbtestsrc=s=1280x720:r=30" \
@@ -34,13 +34,13 @@ ffmpeg -hide_banner -loglevel error -y \
 [cat]${TC}:text='SCENE  %{pts\\:hms}':x=20:y=20[out]" \
   -map "[out]" ${X264} scenes_18s_720p.mp4
 
-echo "[3/5] mandelbrot_15s_1080p.mp4 (continuous fractal zoom, 1920x1080, 15s)"
+echo "[3/6] mandelbrot_15s_1080p.mp4 (continuous fractal zoom, 1920x1080, 15s)"
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -t 15 -i "mandelbrot=s=1920x1080:r=30" \
   -vf "${TC}:text='FRACTAL  %{pts\\:hms}':x=(w-tw)/2:y=40" \
   ${X264} mandelbrot_15s_1080p.mp4
 
-echo "[4/5] counter_25s_vertical.mp4 (testsrc counter, vertical 1080x1920, 25s)"
+echo "[4/6] counter_25s_vertical.mp4 (testsrc counter, vertical 1080x1920, 25s)"
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -t 25 -i "testsrc=s=1080x1920:r=30" \
   -vf "${TC}:text='%{pts\\:hms}   n=%{n}':x=(w-tw)/2:y=60" \
@@ -50,10 +50,23 @@ ffmpeg -hide_banner -loglevel error -y \
 # others do not resemble: they are 720p/1080p with x264's default 250-frame GOP.
 # It is the only clip big enough to take the hardware decode path (HW_MIN_PIXELS)
 # and the only one whose seeks decode a short GOP rather than a long one.
-echo "[5/5] camera_8s_4k.mp4 (4K short-GOP, mimics the target camera footage, 3840x2160, 8s)"
+echo "[5/6] camera_8s_4k.mp4 (4K short-GOP, mimics the target camera footage, 3840x2160, 8s)"
 ffmpeg -hide_banner -loglevel error -y \
   -f lavfi -t 8 -i "testsrc2=s=3840x2160:r=25" \
   -vf "${TC}:text='4K  %{pts\\:hms}   n=%{n}':x=(w-tw)/2:y=60" \
   -g 12 ${X264} camera_8s_4k.mp4
+
+# All-intra, so every frame is a keyframe. The others hold a handful of keyframes
+# (11-25) — fewer than the grid decoder's frame threads, which buffers ~18 frames
+# before releasing the first — so none of their thumbnails appear until the file
+# has been demuxed to the end. Only here do keyframes outnumber the threads and
+# thumbnails start arriving mid-read, which is what makes a cancelled pass
+# distinguishable from a complete one. Tiny and low-res on purpose: the point is
+# the keyframe count, not the pixels.
+echo "[6/6] allintra_4s_240p.mp4 (every frame a keyframe, 320x240, 4s)"
+ffmpeg -hide_banner -loglevel error -y \
+  -f lavfi -t 4 -i "testsrc2=s=320x240:r=30" \
+  -vf "drawtext=fontfile='${FONT}':fontsize=20:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=4:text='%{pts\\:hms}  n=%{n}':x=(w-tw)/2:y=h-th-8" \
+  -g 1 ${X264} allintra_4s_240p.mp4
 
 echo "DONE"

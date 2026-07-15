@@ -4,6 +4,7 @@
 //! Usage: cargo run -p footage-viewer-media --release --example grid_bench -- <video>
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use footage_viewer_media::{extract_grid_streaming, init};
@@ -43,6 +44,8 @@ fn main() -> anyhow::Result<()> {
             &path,
             THUMB_SPACING_S,
             THUMB_LONG,
+            // Nothing to abandon: the bench always measures a whole grid.
+            &AtomicBool::new(false),
             |_| meta_ms = t0.elapsed().as_secs_f64() * 1000.0,
             |_, _| {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
