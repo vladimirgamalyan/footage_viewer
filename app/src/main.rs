@@ -578,7 +578,10 @@ impl App {
         let out = l.path.with_extension("jpg");
         if let Err(e) = media::save_frame_jpeg(&l.path, time_s, &out, STILL_JPEG_QUALITY) {
             log::error!("failed to save still {} at {time_s:.3}s: {e:#}", out.display());
-            self.error = Some(format!("Failed to save still: {e:#}"));
+            self.error = Some(format!(
+                "Could not save the still \"{}\": {e:#}",
+                display_name(&out)
+            ));
         } else {
             log::info!("saved still {}", out.display());
         }
