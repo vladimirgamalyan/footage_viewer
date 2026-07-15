@@ -7,6 +7,14 @@
 - All git commit messages MUST be in English only
 - Project documentation (README.md, files in docs/) MUST be in English only
 
+## Git Workflow
+Commit straight to `main`. Do **not** create a branch unless explicitly asked:
+this project keeps a linear history with no branches, pull requests, or CI, and
+releases are cut from `main` (see `docs/adr/0007`). This overrides any default
+habit of branching before committing.
+
+Committing and pushing still happen only when asked.
+
 ## Code Guidelines
 Follow the behavioral rules in @CODE_GUIDELINES.md
 
