@@ -125,6 +125,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Left / Right", "Previous / next clip in the folder"),
             ("I", "Save the current frame as a JPEG beside the clip"),
             ("Del", "Send the clip to the Recycle Bin and open the next"),
+            ("F12", "Toggle fullscreen"),
             ("Esc", "Close the app"),
         ],
     ),
@@ -1417,6 +1418,17 @@ impl eframe::App for App {
         // over them from its own layer regardless.
         self.flash_ui(&ctx);
         self.help_ui(&ctx);
+
+        // F12 toggles borderless fullscreen. Handled here, above the early
+        // return below, so the one handler serves both views. What it toggles
+        // away from is read back from the viewport rather than kept in a field
+        // of ours: the window can leave fullscreen without us (the window
+        // manager, or the OS), and a field would have the next press turn
+        // fullscreen back on when the user meant to turn it off.
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+        }
 
         // While a clip is playing it fills the window; the grid and its keys are
         // hidden until playback ends or Escape returns here.
