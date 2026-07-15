@@ -83,6 +83,26 @@ const SEEK_REPEAT_DELAY_S: f64 = 0.35;
 /// Interval between repeated A/D seeks while the key is held, in seconds.
 const SEEK_REPEAT_INTERVAL_S: f64 = 0.12;
 
+/// How far playback may be zoomed in, as a multiple of the fit-to-window scale.
+///
+/// Frames arrive capped at [`PLAYBACK_LONG`], so past roughly 2x on a filled
+/// window this magnifies the decoded frame rather than uncovering anything: on
+/// the 4K footage this tool targets the source's detail was resampled away
+/// before the zoom could ever reach it. So this bounds how far a useful
+/// magnifier goes, and is not the point where the picture stops being sharp —
+/// it stopped before here. Raising [`PLAYBACK_LONG`] is what would buy real
+/// detail, at a scaling and upload cost paid on every frame of every clip
+/// whether it is zoomed or not.
+const ZOOM_MAX: f32 = 8.0;
+
+/// What one press of `+`/`-` multiplies (or divides) the playback zoom by.
+const ZOOM_KEY_STEP: f32 = 1.25;
+
+/// Scroll points to zoom multiplier: `exp(points * this)`. Matches egui's own
+/// ctrl-scroll speed, which puts one wheel notch (40 points) at ~1.22x — near
+/// enough to [`ZOOM_KEY_STEP`] that wheel and keys feel like one control.
+const ZOOM_WHEEL_SPEED: f32 = 1.0 / 200.0;
+
 /// JPEG quality for stills saved with the "I" key (1–100). 92 keeps 4:4:4 chroma
 /// subsampling and near-lossless detail at a reasonable file size.
 const STILL_JPEG_QUALITY: u8 = 92;
@@ -111,9 +131,12 @@ const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v"];
 
 /// What the help plate lists: a section heading and the keys under it.
 ///
-/// Keys only. Clicking a thumbnail or dragging the scrubber is found by simply
-/// using the mouse, whereas nothing on screen announces any of these — which is
-/// what the plate exists to fix.
+/// Keys, and the one mouse gesture that hides. Clicking a thumbnail or dragging
+/// the scrubber is found by simply using the mouse, whereas nothing on screen
+/// announces any of these — which is what the plate exists to fix. Dragging the
+/// frame belongs with the keys because it does nothing at all until the frame is
+/// zoomed, so anyone who tries it first and pans later has already learnt it
+/// doesn't work.
 ///
 /// The sections earn their place: several keys mean different things depending
 /// on the view, so a flat list would contradict itself on Enter and A/D.
@@ -142,6 +165,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Space", "Pause or resume"),
             ("A / D", "Step half a second back / forward, and pause"),
+            ("+ / - / Wheel", "Zoom into the frame"),
+            ("Drag / 0", "Move the zoomed frame / fit it again"),
             ("Enter", "Back to the grid"),
         ],
     ),
@@ -386,6 +411,69 @@ struct Player {
     scrub: Option<f64>,
 }
 
+/// How the played frame is placed in the video area: `zoom` as a multiple of the
+/// fit-to-window scale (1.0 being the whole frame letterboxed), and `offset`
+/// shifting it from centered, in screen points.
+///
+/// Kept on [`App`] rather than [`Player`] so it survives a trip back to the grid
+/// and a replay of the same clip — the frame being studied is usually the reason
+/// for that trip. [`open`](App::open) resets it, so a new clip always arrives
+/// whole.
+struct View {
+    zoom: f32,
+    offset: egui::Vec2,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            offset: egui::Vec2::ZERO,
+        }
+    }
+}
+
+impl View {
+    /// Where the frame lands inside `container`: the fit rect scaled by `zoom`
+    /// about the container's center, shifted by `offset`.
+    ///
+    /// Clamps `offset` on the way, which is what stops a drag from throwing the
+    /// frame off into the black: an axis the zoomed frame overflows may be panned
+    /// only as far as its own edge, and one it doesn't fill has no slack at all,
+    /// so it stays centered exactly as it did before any of this existed. That
+    /// also means zoom 1.0 pins the offset to zero and no separate "is it zoomed"
+    /// test is needed anywhere.
+    ///
+    /// Clamping here rather than where the drag is read is what makes that true
+    /// for every path into the offset — a drag, a zoom out from a panned-away
+    /// corner, or the window being resized under a still frame.
+    fn place(&mut self, container: egui::Rect, frame_size: egui::Vec2) -> egui::Rect {
+        let size = fit_centered(container, frame_size).size() * self.zoom;
+        let slack = ((size - container.size()) * 0.5).max(egui::Vec2::ZERO);
+        self.offset = self.offset.clamp(-slack, slack);
+        egui::Rect::from_center_size(container.center() + self.offset, size)
+    }
+
+    /// Multiply the zoom by `factor`, keeping whatever sits under `anchor` there.
+    ///
+    /// Anchoring is what makes the wheel land on the thing being looked at rather
+    /// than the middle of the window; `+`/`-` pass the center and get plain zoom
+    /// about it.
+    fn zoom_by(&mut self, factor: f32, anchor: egui::Pos2, container: egui::Rect) {
+        let before = self.zoom;
+        self.zoom = (self.zoom * factor).clamp(1.0, ZOOM_MAX);
+        // Read back rather than reusing `factor`: at either end of the clamp the
+        // zoom didn't move the whole way (or at all), and scaling the offset by
+        // what was asked for would drift the frame under a wheel that is doing
+        // nothing.
+        let scale = self.zoom / before;
+        // The frame's center is `container.center() + offset`. Scaling that about
+        // `anchor` is what holds the anchored point still.
+        let center = container.center() + self.offset;
+        self.offset = (center - anchor) * scale + anchor.to_vec2() - container.center().to_vec2();
+    }
+}
+
 /// A clip being (or already) loaded.
 struct Loaded {
     path: PathBuf,
@@ -453,6 +541,8 @@ struct App {
     /// How many columns the frame grid shows; changed with the `-`/`+` keys and
     /// kept across clips. Clamped to [`GRID_COLS_MIN`]..=[`GRID_COLS_MAX`].
     grid_cols: usize,
+    /// Zoom and pan of the played frame. See [`View`].
+    view: View,
     /// The confirmation icon currently fading over the view, if any.
     flash: Option<Flash>,
     /// The plate listing the keys, shown for as long as H is held.
@@ -524,6 +614,10 @@ impl App {
         self.player = None;
         // A new clip deserves its own look ahead.
         self.looked_ahead = false;
+        // ...and its own zoom: a crop framed on the last clip means nothing on
+        // this one, and stepping through a folder zoomed in would hide that the
+        // clip even changed.
+        self.view = View::default();
 
         // Set the outgoing grid aside before looking, so re-opening the very clip
         // being left still finds it.
@@ -1099,12 +1193,13 @@ impl App {
         true
     }
 
-    /// Draw the playing clip filling the window and handle its keys. A click in
-    /// the video area, Enter, or a decode error returns to the grid; Escape closes
-    /// the app. A scrubber along the bottom shows the position and seeks on drag or
-    /// click. Left/Right play the previous/next sibling clip from its start,
-    /// staying in playback; Space pauses; A/D nudge the position back/forward
-    /// by half a second (auto-repeating on hold) and pause on that frame.
+    /// Draw the playing clip filling the window and handle its keys. Enter or a
+    /// decode error returns to the grid; Escape closes the app. A scrubber along
+    /// the bottom shows the position and seeks on drag or click. Left/Right play
+    /// the previous/next sibling clip from its start, staying in playback; Space
+    /// pauses; A/D nudge the position back/forward by half a second
+    /// (auto-repeating on hold) and pause on that frame. `+`/`-`/wheel zoom the
+    /// frame and dragging it pans (see [`View`]).
     fn playback_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Left/Right switch to the previous/next sibling clip and keep playing:
         // open() loads the new clip (and kicks off its background grid), then we
@@ -1203,9 +1298,9 @@ impl App {
         }
 
         // Full-window black backdrop: the frame is letterboxed above a scrubber
-        // strip. A click in the video area returns to the grid; the scrubber
-        // handles its own clicks and drags.
-        let (clicked, seek) = egui::CentralPanel::default()
+        // strip. Dragging the video area pans it and the wheel zooms it; the
+        // scrubber handles its own clicks and drags.
+        let seek = egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ui, |ui| {
                 let full = ui.max_rect();
@@ -1216,30 +1311,73 @@ impl App {
                 let bar_rect =
                     egui::Rect::from_min_max(egui::pos2(full.min.x, split), full.max);
 
-                let resp = ui.interact(video_rect, ui.id().with("playback"), egui::Sense::click());
-                if let Some(p) = &self.player {
-                    if let Some(tex) = &p.tex {
-                        let target = fit_centered(video_rect, p.frame_size);
-                        let uv =
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                        ui.painter().image(tex.id(), target, uv, egui::Color32::WHITE);
+                let resp = ui.interact(video_rect, ui.id().with("playback"), egui::Sense::drag());
+
+                // "0" drops back to the whole frame — the way out of a zoom that
+                // "-" can also walk back but only a step at a time.
+                let (zoom_in, zoom_out, reset) = ctx.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                        i.key_pressed(egui::Key::Minus),
+                        i.key_pressed(egui::Key::Num0),
+                    )
+                });
+                if reset {
+                    self.view = View::default();
+                }
+                if zoom_in {
+                    self.view.zoom_by(ZOOM_KEY_STEP, video_rect.center(), video_rect);
+                }
+                if zoom_out {
+                    self.view
+                        .zoom_by(1.0 / ZOOM_KEY_STEP, video_rect.center(), video_rect);
+                }
+
+                // The wheel zooms about the cursor. Exponential so each notch is
+                // the same proportional step wherever the zoom already is, and
+                // read from the smoothed delta so a spun wheel ramps rather than
+                // jumping in notch-sized leaps. egui repaints while that smoothing
+                // has more to give, so the tail arrives even with playback paused.
+                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                if resp.hovered() && scroll != 0.0 {
+                    if let Some(at) = ctx.input(|i| i.pointer.latest_pos()) {
+                        self.view
+                            .zoom_by((scroll * ZOOM_WHEEL_SPEED).exp(), at, video_rect);
                     }
+                }
+
+                // Dragging moves the frame with the cursor. `place` clamps the
+                // offset, so at fit scale this is inert rather than special-cased.
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    self.view.offset += resp.drag_delta();
+                }
+
+                // Taken by value so `place` can borrow the view mutably below.
+                let shown = self
+                    .player
+                    .as_ref()
+                    .and_then(|p| p.tex.as_ref().map(|t| (t.id(), p.frame_size)));
+                if let Some((tex, frame_size)) = shown {
+                    let target = self.view.place(video_rect, frame_size);
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    // Clipped: a zoomed frame is larger than the area it plays in
+                    // and would otherwise paint straight over the scrubber.
+                    ui.painter()
+                        .with_clip_rect(video_rect)
+                        .image(tex, target, uv, egui::Color32::WHITE);
                 }
 
                 let mut cmd = None;
                 if let Some(p) = &mut self.player {
                     cmd = seek_bar_ui(ui, bar_rect, p, &mut self.scrub_in_flight, duration_s);
                 }
-                (resp.clicked(), cmd)
+                cmd
             })
             .inner;
 
         // Seeks go to the live decoder as commands — the player stays put.
         if let Some(cmd) = seek {
             self.send_cmd(cmd);
-        }
-        if clicked {
-            self.stop_playback();
         }
     }
 }
@@ -2151,6 +2289,92 @@ mod tests {
 
         assert!(matches!(state, Help::Held), "H should have taken the plate back");
         assert_eq!(alpha, Some(1.0), "the plate should be solid again, not still fading");
+    }
+
+    /// A 400x200 view showing a 2:1 frame, so the fit rect is the whole view and
+    /// the arithmetic below stays readable.
+    fn view_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0))
+    }
+    const FRAME: egui::Vec2 = egui::vec2(2000.0, 1000.0);
+
+    /// Unzoomed playback is exactly the letterboxed fit it was before zoom
+    /// existed, and no drag can shift it: there is nothing off screen to pan to.
+    #[test]
+    fn an_unzoomed_frame_is_centered_and_cannot_be_panned() {
+        // As if dragged.
+        let mut view = View { offset: egui::vec2(50.0, 50.0), ..Default::default() };
+
+        let target = view.place(view_rect(), FRAME);
+
+        assert_eq!(target, fit_centered(view_rect(), FRAME), "fit, ignoring the drag");
+        assert_eq!(view.offset, egui::Vec2::ZERO, "the drag should have been clamped away");
+    }
+
+    /// Panning stops at the frame's edge instead of letting it drift off into the
+    /// black. At 2x the 400x200 view holds an 800x400 frame, so 200 points of it
+    /// hang off horizontally and 100 vertically — exactly the slack to pan into.
+    #[test]
+    fn panning_stops_at_the_edge_of_the_zoomed_frame() {
+        let mut view = View { zoom: 2.0, offset: egui::vec2(5000.0, -5000.0) };
+
+        let target = view.place(view_rect(), FRAME);
+
+        assert_eq!(view.offset, egui::vec2(200.0, -100.0), "clamped to the frame's edges");
+        assert_eq!(target.min.x, 0.0, "the frame's left edge should sit on the view's");
+        assert_eq!(target.max.y, 200.0, "and its bottom edge on the view's bottom");
+    }
+
+    /// The wheel zooms about the cursor: whatever pixel sits under it stays there,
+    /// which is what makes zooming land on the thing being looked at.
+    #[test]
+    fn zooming_holds_the_point_under_the_cursor() {
+        let rect = view_rect();
+        let at = egui::pos2(100.0, 50.0); // off-center, so an unanchored zoom would move it
+        let mut view = View::default();
+        let before = view.place(rect, FRAME);
+        // Where the cursor sits within the frame, as a fraction of it.
+        let frac = (at - before.min) / before.size();
+
+        view.zoom_by(2.0, at, rect);
+        let after = view.place(rect, FRAME);
+
+        let moved_to = after.min + (frac * after.size());
+        assert!(
+            (moved_to - at).length() < 0.01,
+            "the anchored point moved from {at:?} to {moved_to:?}",
+        );
+    }
+
+    /// Zooming out never goes past the whole frame, and coming back to fit leaves
+    /// no leftover pan — a zoom out from a panned-away corner re-centers.
+    #[test]
+    fn zooming_out_bottoms_out_at_fit_with_no_leftover_pan() {
+        let rect = view_rect();
+        let mut view = View { zoom: 2.0, offset: egui::vec2(100.0, 50.0) };
+
+        // Far more zoom-out than it takes to get back to 1.0.
+        for _ in 0..20 {
+            view.zoom_by(1.0 / ZOOM_KEY_STEP, egui::pos2(0.0, 0.0), rect);
+        }
+        let target = view.place(rect, FRAME);
+
+        assert_eq!(view.zoom, 1.0, "zoom should have stopped at the whole frame");
+        assert_eq!(target, fit_centered(rect, FRAME), "and left it centered");
+    }
+
+    /// Zoom in stops at [`ZOOM_MAX`] rather than running away into a texture that
+    /// has no more detail to give.
+    #[test]
+    fn zooming_in_stops_at_the_cap() {
+        let rect = view_rect();
+        let mut view = View::default();
+
+        for _ in 0..100 {
+            view.zoom_by(ZOOM_KEY_STEP, rect.center(), rect);
+        }
+
+        assert_eq!(view.zoom, ZOOM_MAX);
     }
 
     #[test]
