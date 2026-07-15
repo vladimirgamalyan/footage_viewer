@@ -7,6 +7,7 @@
 //! `docs/adr/0003-keyframe-contact-sheet.md` for why this replaced the per-cell
 //! seek approach.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
@@ -41,6 +42,16 @@ const FRAME_EPS_S: f64 = 1e-3;
 /// half-second steps and small drags while never decoding across more than a
 /// short gap.
 const FORWARD_SCRUB_LIMIT_S: f64 = 2.0;
+
+/// Memory [`ScrubCache`] may hold, in bytes.
+///
+/// Sized in bytes rather than frames because a frame's cost is set by the
+/// playback box, not the source: at the UI's 1600 px box a 4K clip scales to
+/// ~5.8 MB per frame, so this keeps ~22 of them — around 11 s of A/D stepping,
+/// which covers the back-and-forth a real session does over one stretch. Smaller
+/// footage scales to less and so gets proportionally more frames for the same
+/// memory, which is what we want: those clips are scrubbed the same way.
+const SCRUB_CACHE_BYTES: usize = 128 << 20;
 
 /// Log a one-line timing breakdown for each live seek (Scrub/Play), to diagnose
 /// scrub latency on a tester's footage. Flip to `false` to silence it.
@@ -221,6 +232,84 @@ impl HwDevice {
     /// `ctx` must be a valid, not-yet-opened decoder context.
     unsafe fn attach(&self, ctx: *mut ffmpeg::sys::AVCodecContext) {
         (*ctx).hw_device_ctx = ffmpeg::sys::av_buffer_ref(self.0);
+    }
+}
+
+/// Scaled frames a scrub has already shown, so stepping back over ground just
+/// covered re-shows them instead of re-deriving them from the stream.
+///
+/// A scrub step backward cannot decode in place: it seeks to the keyframe before
+/// the target and decodes the GOP forward again, and the next step back seeks to
+/// that same keyframe and decodes almost the same frames once more. A tester's
+/// log (see `docs/adr/0012`) shows what that costs on real footage: 1833 frames
+/// decoded to show 120, and a third of all scrubs asking for a frame that had
+/// been decoded seconds earlier. The frames are already scaled and paid for, so
+/// the fix is to keep them rather than to decode more cleverly.
+///
+/// Only frames a `Scrub` emitted are kept. A `Play` streams frames continuously
+/// and would evict the whole cache in a second of footage for frames nobody will
+/// ask for again, and it must move the decoder anyway.
+struct ScrubCache {
+    /// Newest last; evicted oldest-first once [`SCRUB_CACHE_BYTES`] is exceeded.
+    /// Insertion order is close enough to recency here — a scrub inserts every
+    /// frame it shows, so a frame served from the cache is one this pass already
+    /// walked past, and re-ordering on hit would buy nothing a scrub can use.
+    frames: VecDeque<Thumbnail>,
+    bytes: usize,
+    /// Nominal frame duration, which sets how far a cached frame may sit from a
+    /// target and still be the frame at it. Zero when the stream declares no
+    /// frame rate, which disables the cache rather than risk showing the wrong
+    /// frame: [`get`](Self::get) can then never satisfy its own bound.
+    frame_dur_s: f64,
+}
+
+impl ScrubCache {
+    fn new(frame_dur_s: f64) -> Self {
+        Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+            frame_dur_s,
+        }
+    }
+
+    /// The frame a scrub to `target_s` would land on, if it is already held.
+    ///
+    /// This must answer exactly what the decode loop would, or the cache shows a
+    /// different frame than a decode of the same target. The loop emits the first
+    /// frame at or after `target_s − FRAME_EPS_S`, so this takes the earliest
+    /// cached frame at or after that same bound, and only trusts it when it sits
+    /// within one frame of it: on a constant frame rate a nearer frame would then
+    /// have to lie before the bound, where the loop would not have emitted it
+    /// either. A gap wider than that means the frames between are simply not held
+    /// and one of *them* is the answer — so this misses and lets the decoder run.
+    fn get(&self, target_s: f64) -> Option<&Thumbnail> {
+        let from = target_s - FRAME_EPS_S;
+        self.frames
+            .iter()
+            .filter(|f| f.time_s >= from)
+            .min_by(|a, b| a.time_s.total_cmp(&b.time_s))
+            .filter(|f| f.time_s - from < self.frame_dur_s)
+    }
+
+    /// Keep a copy of a frame a scrub just showed, evicting the oldest frames
+    /// until the cache is back within its budget.
+    fn put(&mut self, f: &Thumbnail) {
+        if self.frame_dur_s <= 0.0 || self.get(f.time_s).is_some() {
+            return;
+        }
+        self.bytes += f.rgba.len();
+        self.frames.push_back(Thumbnail {
+            time_s: f.time_s,
+            width: f.width,
+            height: f.height,
+            rgba: f.rgba.clone(),
+        });
+        while self.bytes > SCRUB_CACHE_BYTES {
+            match self.frames.pop_front() {
+                Some(old) => self.bytes -= old.rgba.len(),
+                None => break,
+            }
+        }
     }
 }
 
@@ -643,6 +732,15 @@ pub fn play_stream(
         _ => 0.0,
     };
 
+    // Read while the stream is still borrowed. Zero when the container declares
+    // no rate, which turns the scrub cache off (see [`ScrubCache::frame_dur_s`]).
+    let frame_dur_s = match stream.avg_frame_rate() {
+        r if r.numerator() > 0 && r.denominator() > 0 => {
+            r.denominator() as f64 / r.numerator() as f64
+        }
+        _ => 0.0,
+    };
+
     let mut decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
     // Frame size before the decoder is opened, to decide on hardware decode.
     // `from_parameters` has already copied it into the context.
@@ -692,6 +790,8 @@ pub fn play_stream(
     // Most recent frame skipped while precise-seeking; emitted if the seek target
     // lies past the last frame, so stepping/scrubbing to the end lands on it.
     let mut last_skipped: Option<Video> = None;
+    // Frames this clip's scrubs have shown, to serve the ones they ask for twice.
+    let mut cache = ScrubCache::new(frame_dur_s);
     // Timing for the in-flight live seek, logged when its frame lands.
     let mut profile: Option<SeekProfile> = None;
 
@@ -728,6 +828,49 @@ pub fn play_stream(
                     decoded: 0,
                     decode_ms: 0.0,
                 });
+            }
+        }
+
+        // Serve a scrub from the frames it has already shown. This is checked
+        // before the seek below because that seek is the whole cost: the frame is
+        // scaled and ready, so a hit answers in the time of a memcpy instead of a
+        // keyframe seek and a GOP of decoding.
+        //
+        // The decoder is deliberately left where it stands rather than moved to
+        // the frame shown — a hit does no decoding, so `current_s` keeps meaning
+        // "where the decoder is", which is what `start_move` needs to choose
+        // between decoding forward in place and seeking back to a keyframe. The
+        // frame on screen and the decoder's position are simply allowed to differ
+        // while a scrub walks over held ground.
+        if st.hold_after {
+            if let Some(target_s) = st.skip_until.or(st.pending_seek.map(|(t, _)| t)) {
+                if let Some(hit) = cache.get(target_s).map(|f| PlaybackFrame {
+                    time_s: f.time_s,
+                    width: f.width,
+                    height: f.height,
+                    rgba: f.rgba.clone(),
+                }) {
+                    let landed_s = hit.time_s;
+                    if !on_frame(hit) {
+                        return Ok(());
+                    }
+                    // Reported like a decoded landing, so a tester's log shows
+                    // what the cache is actually catching (see docs/adr/0008).
+                    if let Some(p) = profile.take() {
+                        log::info!(
+                            "scrub -> {:.3}s | total {:.1}ms | cached | landed {:.3}s",
+                            p.target_s,
+                            millis(p.start.elapsed()),
+                            landed_s,
+                        );
+                    }
+                    st.skip_until = None;
+                    st.pending_seek = None;
+                    st.hold_after = false;
+                    st.paused = true;
+                    st.anchor = None;
+                    continue;
+                }
             }
         }
 
@@ -872,6 +1015,11 @@ pub fn play_stream(
             }
         };
         let t = scale_thumb(scaler, &frame, out_w, out_h, time_s)?;
+        // Hold the frames a scrub lands on: a scrub walks back over its own
+        // ground constantly, and this one is scaled and paid for already.
+        if st.hold_after {
+            cache.put(&t);
+        }
         if !on_frame(PlaybackFrame {
             time_s: t.time_s,
             width: t.width,
@@ -1206,6 +1354,109 @@ mod tests {
 
         cmd_tx.send(PlayCommand::Stop).unwrap();
         worker.join().unwrap().unwrap();
+    }
+
+    fn cached(time_s: f64) -> Thumbnail {
+        Thumbnail {
+            time_s,
+            width: 2,
+            height: 1,
+            rgba: vec![0; 8],
+        }
+    }
+
+    /// The cache must answer a target exactly as a decode of it would, because a
+    /// hit replaces that decode. The decode loop emits the first frame at or after
+    /// `target − FRAME_EPS_S`, so a held frame may serve a target only when no
+    /// unheld frame could sit between the two — i.e. within one frame duration.
+    /// Getting this wrong shows the neighbouring frame, which is the exact defect
+    /// (a scrub silently stepping a frame off target) the cache exists to remove.
+    #[test]
+    fn scrub_cache_serves_a_target_only_when_it_holds_that_frame() {
+        let mut c = ScrubCache::new(1.0 / 25.0); // 40 ms frames
+        for t in [1.00_f64, 1.04, 2.00] {
+            c.put(&cached(t));
+        }
+
+        // Exactly the frame asked for, and the ε-slack the loop lands within.
+        assert_eq!(c.get(1.00).map(|f| f.time_s), Some(1.00));
+        assert_eq!(c.get(1.0009).map(|f| f.time_s), Some(1.00));
+        // Between two held frames: the later one is what a decode would emit.
+        assert_eq!(c.get(1.02).map(|f| f.time_s), Some(1.04));
+        // A gap wider than a frame: the frames between 1.04 and 2.00 are not held,
+        // and one of them — not 2.00 — is the frame at 1.5.
+        assert_eq!(c.get(1.5).map(|f| f.time_s), None);
+        // Past everything held.
+        assert_eq!(c.get(2.5).map(|f| f.time_s), None);
+
+        // A stream with no declared frame rate disables the cache outright rather
+        // than guess how far a frame's reach extends.
+        let mut off = ScrubCache::new(0.0);
+        off.put(&cached(1.0));
+        assert!(off.get(1.0).is_none(), "cache must be off without a frame rate");
+        assert!(off.frames.is_empty(), "a disabled cache must not hold frames");
+    }
+
+    /// Scrubbing to a position twice must show the same frame both times.
+    ///
+    /// Without the cache the second scrub steps a frame *forward*: the decoder
+    /// already sits on the frame it emitted, `start_move` sees the target as ahead
+    /// of it and decodes in place, and the loop emits the next frame at or after
+    /// the target — the one after the one on screen. A tester's log shows this as
+    /// `decoded 1 frames | landed <target + one frame>` (docs/adr/0012). The cache
+    /// removes it: the frame is held, so the repeat is answered with it.
+    #[test]
+    fn re_scrubbing_a_position_shows_the_same_frame() {
+        init().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel::<(f64, Vec<u8>)>();
+        let path = test_video("counter_25s_vertical.mp4");
+
+        let worker = std::thread::spawn(move || {
+            play_stream(&path, 0.0, 320, cmd_rx, |f| {
+                frame_tx.send((f.time_s, f.rgba)).is_ok()
+            })
+        });
+        frame_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no first frame");
+
+        let land = |target: f64| {
+            cmd_tx.send(PlayCommand::Scrub(target)).unwrap();
+            while let Ok((t, rgba)) = frame_rx.recv_timeout(Duration::from_secs(10)) {
+                if (t - target).abs() < 0.06 {
+                    return (t, rgba);
+                }
+            }
+            panic!("scrub did not land near {target}s");
+        };
+
+        let (first_s, first_rgba) = land(12.0);
+        let (again_s, again_rgba) = land(12.0);
+        // Scrub away and back: the revisit a backward step makes, and the case the
+        // cache exists for. It lands the same frame either way — a decode of a
+        // target is what a hit stands in for — so this guards the cache against
+        // serving a *neighbouring* held frame, which is how a wrong reach would
+        // show up here.
+        land(11.0);
+        let (revisit_s, revisit_rgba) = land(12.0);
+
+        cmd_tx.send(PlayCommand::Stop).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert_eq!(
+            first_s, again_s,
+            "re-scrubbing 12s stepped off the frame it just showed"
+        );
+        assert!(
+            first_rgba == again_rgba,
+            "re-scrubbing 12s showed different pixels"
+        );
+        assert_eq!(first_s, revisit_s, "scrubbing back to 12s landed elsewhere");
+        assert!(
+            first_rgba == revisit_rgba,
+            "scrubbing back to 12s showed different pixels"
+        );
     }
 
     /// A 4K clip's grid is big enough to take the hardware decode path

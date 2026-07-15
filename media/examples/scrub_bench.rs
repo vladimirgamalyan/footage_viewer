@@ -22,6 +22,12 @@ const DRAG_SECS: f64 = 2.0;
 /// A frame counts as the one asked for when it lands within this of the target.
 const HIT_EPS_S: f64 = 0.06;
 
+/// The A/D sweep: the UI's own step size (`SEEK_STEP_S`), walked out to the end of
+/// the clip and back over the same positions.
+const STEP_S: f64 = 0.5;
+const STEP_FROM_S: f64 = 1.0;
+const STEP_TO_S: f64 = 7.0;
+
 /// Print the media crate's own per-seek timing breakdown.
 struct Stdout;
 impl log::Log for Stdout {
@@ -111,13 +117,47 @@ fn main() -> anyhow::Result<()> {
         // How far the picture trails the cursor right now: the perceived lag.
         lag.push((cursor - shown).abs());
     }
+    println!(
+        "sent {sent} scrubs in {DRAG_SECS}s | picture trails cursor: mean {:.2}s max {:.2}s\n",
+        lag.iter().sum::<f64>() / lag.len() as f64,
+        lag.iter().cloned().fold(0.0, f64::max),
+    );
+
+    // Step through with A/D and back again — what a tester's log actually shows
+    // someone doing (docs/adr/0012), and the pattern a drag cannot measure: every
+    // step of the return walks over frames the outward pass just showed. Each step
+    // waits for the previous to land, exactly as the UI's key-repeat gate does.
+    println!("--- A/D sweep ({STEP_S}s steps, {STEP_FROM_S}s -> {STEP_TO_S}s -> {STEP_FROM_S}s)");
+    let steps: Vec<f64> = {
+        let n = ((STEP_TO_S - STEP_FROM_S) / STEP_S) as usize;
+        let out: Vec<f64> = (0..=n).map(|i| STEP_FROM_S + i as f64 * STEP_S).collect();
+        out.iter().chain(out.iter().rev().skip(1)).cloned().collect()
+    };
+    let mut out_ms = Vec::new();
+    let mut back_ms = Vec::new();
+    let turn = steps.len() / 2;
+    for (i, target) in steps.iter().enumerate() {
+        cmd_tx.send(PlayCommand::Scrub(*target))?;
+        let start = Instant::now();
+        while let Ok(t) = frame_rx.recv_timeout(Duration::from_secs(30)) {
+            if (t - target).abs() < HIT_EPS_S {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                if i < turn { &mut out_ms } else { &mut back_ms }.push(ms);
+                break;
+            }
+        }
+    }
     cmd_tx.send(PlayCommand::Stop)?;
     worker.join().unwrap()?;
 
+    let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
     println!(
-        "sent {sent} scrubs in {DRAG_SECS}s | picture trails cursor: mean {:.2}s max {:.2}s",
-        lag.iter().sum::<f64>() / lag.len() as f64,
-        lag.iter().cloned().fold(0.0, f64::max),
+        "outward n={} mean {:.1}ms | back over the same ground n={} mean {:.1}ms | sweep {:.2}s",
+        out_ms.len(),
+        mean(&out_ms),
+        back_ms.len(),
+        mean(&back_ms),
+        (out_ms.iter().sum::<f64>() + back_ms.iter().sum::<f64>()) / 1000.0,
     );
     Ok(())
 }
