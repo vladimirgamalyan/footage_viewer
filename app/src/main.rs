@@ -46,6 +46,29 @@ const PLAYBACK_LONG: u32 = 1600;
 /// budget is simply never cached, which is the right way to give up on it.
 const RECENT_MAX_THUMBS: usize = 200;
 
+/// How many thumbnails an extraction worker may queue ahead of whoever polls it.
+///
+/// Only the read-ahead ever reaches this bound. The foreground grid is drained
+/// every frame, but a prefetch is polled by nobody until it is opened, so with an
+/// unbounded queue its worker reads the whole sibling regardless of length —
+/// ~0.23 MB per thumbnail and roughly one per second of footage, so an hour-long
+/// neighbour is ~800 MB of buffered thumbnails and minutes of the one disk head,
+/// spent on a clip nobody asked for. That is the same "thousands for a long
+/// recording" that [`RECENT_MAX_THUMBS`] exists to bound, on the one path that
+/// was left unbounded.
+///
+/// A full queue blocks the worker inside its `on_thumb` callback, which is called
+/// from the demux loop — so the read itself stops, keeping its position, decoder
+/// and file handle. Opening the clip drains the queue and the read resumes from
+/// where it parked, which is why this bounds the cost without the restart-from-
+/// zero that made cancelling a read-ahead on play unworkable (see docs/adr/0011).
+/// Dropping the clip releases a parked worker too: the receiver goes with it, the
+/// blocked send fails, and the next cancel check stops the pass.
+///
+/// Sized well clear of the 11-25 thumbnails of the clips this tool targets, so
+/// reading one of those ahead still completes in full and this never bites.
+const GRID_QUEUE_THUMBS: usize = 64;
+
 /// Smallest cursor move (in media seconds) that triggers a new live seek while
 /// dragging. Holding within this of the current position keeps the frozen frame
 /// instead of restarting the decoder on the same spot.
@@ -226,7 +249,9 @@ struct App {
     recent: VecDeque<Loaded>,
     /// The next sibling's grid, being read in the background so stepping forward
     /// is instant. Its thumbnails stay in the channel until it is opened — only
-    /// then does anyone poll them. See [`look_ahead`](Self::look_ahead).
+    /// then does anyone poll them, so its worker parks once the channel is full
+    /// ([`GRID_QUEUE_THUMBS`]) and a long sibling can neither fill memory nor hold
+    /// the disk to the end. See [`look_ahead`](Self::look_ahead).
     prefetch: Option<Loaded>,
     /// Whether the current clip has had its look-ahead decision made, so the
     /// folder is scanned once per clip rather than once per repaint.
@@ -811,8 +836,12 @@ fn seek_bar_ui(
 /// its thumbnails stream into. The thumbnails wait in the channel until someone
 /// polls them, so this is equally the way a clip is opened and the way one is
 /// read ahead — the difference is only which slot holds the result.
+///
+/// The channel is bounded ([`GRID_QUEUE_THUMBS`]): a worker whose thumbnails
+/// nobody is taking parks instead of reading a whole clip into memory. That only
+/// ever happens to a read-ahead, since the foreground grid is drained every frame.
 fn spawn_extraction(ctx: &egui::Context, path: PathBuf) -> Loaded {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(GRID_QUEUE_THUMBS);
     let (tx_meta, tx_thumb) = (tx.clone(), tx.clone());
     let (ctx_meta, ctx_thumb, ctx_end) = (ctx.clone(), ctx.clone(), ctx.clone());
     let worker_path = path.clone();
