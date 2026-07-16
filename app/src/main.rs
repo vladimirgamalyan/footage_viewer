@@ -198,6 +198,22 @@ fn caret_before_ext(name: &str) -> usize {
     name[..stem].chars().count()
 }
 
+/// The clip's name as the rename dialog first shows it: a space worked in just
+/// before the extension's dot, unless one is already sitting there. The dialog
+/// opens its caret on that gap (see [`caret_before_ext`]), so a suffix can be
+/// typed straight onto the name without it butting up against the `.mp4`.
+///
+/// A name with no extension, or one that is all extension (a leading dot), is
+/// left as it is — there is no stem to hold the space away from.
+fn seed_rename_name(name: &str) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && !name[..dot].ends_with(' ') => {
+            format!("{} {}", &name[..dot], &name[dot..])
+        }
+        _ => name.to_owned(),
+    }
+}
+
 /// Whether `candidate` names a file that is already there and is not `current`
 /// itself.
 ///
@@ -1086,7 +1102,7 @@ impl App {
     fn begin_rename(&mut self) {
         let Some(l) = &self.loaded else { return };
         self.rename = Some(Rename {
-            name: display_name(&l.path),
+            name: seed_rename_name(&display_name(&l.path)),
             seeded: false,
             error: None,
         });
@@ -1118,16 +1134,52 @@ impl App {
         }
 
         let mut confirm = false;
+        let mut closed = false;
         let modal = egui::Modal::new(egui::Id::new("rename")).show(ctx, |ui| {
             // Wide enough for the target archive's long names without the field
             // scrolling, and the dialog is sized by it rather than by the name —
-            // so it doesn't resize itself under every keystroke.
-            ui.set_min_width(460.0);
-            ui.label("Rename clip");
-            ui.add_space(6.0);
-            let out = egui::TextEdit::singleline(&mut r.name)
-                .desired_width(f32::INFINITY)
-                .show(ui);
+            // so it doesn't resize itself under every keystroke. Fixed rather
+            // than a minimum: the field fills the width, so an unbounded maximum
+            // would let the doubled-size text push the dialog past the window.
+            ui.set_width(460.0);
+            // Twice the body size: this is the one field the dialog is for, and
+            // the archive is worked at arm's length where the default is a squint.
+            let body = egui::TextStyle::Body.resolve(ui.style());
+            let font = egui::FontId::new(body.size * 2.0, body.family.clone());
+            let row_h = font.size + 16.0;
+            // The field and its two buttons on one row, given a fixed height:
+            // the modal's height is unbounded, so a bare right-to-left layout
+            // would centre the row down the middle of the whole window and
+            // stretch the dialog with it.
+            let out = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(460.0, row_h),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // Right to left, so the first added sits furthest right:
+                        // cancel on the outside, confirm beside the field, and
+                        // the field takes whatever is left. Both glyphs are the
+                        // heavy variants because the plain ✓ and ✕ are in none of
+                        // the bundled fonts and would draw as empty boxes; these
+                        // two share NotoEmoji, so they come out a matched pair.
+                        if ui.button(egui::RichText::new("\u{2716}").size(24.0)).clicked() {
+                            closed = true;
+                        }
+                        if ui.button(egui::RichText::new("\u{2714}").size(24.0)).clicked() {
+                            confirm = true;
+                        }
+                        // What the buttons left, asked for by measure: an
+                        // infinite width is not trimmed to the space left in a
+                        // right-to-left row, so the field would take the whole
+                        // row and shoulder the buttons off the end of it.
+                        let rest = ui.available_width();
+                        egui::TextEdit::singleline(&mut r.name)
+                            .desired_width(rest)
+                            .font(font)
+                            .show(ui)
+                    },
+                )
+                .inner;
             if !r.seeded {
                 // The field has no focus on the frame it first appears, so what
                 // is stored here is what it picks up when the focus lands next
@@ -1142,17 +1194,21 @@ impl App {
                 state.store(ctx, out.response.id);
                 r.seeded = true;
             }
-            // Enter confirms. Read through `lost_focus` because that is what a
-            // single-line field does with Enter — it is the press that ends the
-            // edit, not any press while it runs.
-            confirm = out.response.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            // Enter confirms, the same as the tick — so this sets the flag
+            // rather than replacing it, or the click above would be undone.
+            // Read through `lost_focus` because that is what a single-line field
+            // does with Enter: it is the press that ends the edit, not any press
+            // while it runs.
+            if out.response.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                confirm = true;
+            }
             if let Some(e) = &r.error {
                 ui.add_space(6.0);
                 ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
             }
         });
-        // Escape, or a click on the backdrop.
-        let cancel = modal.should_close();
+        // Escape, a click on the backdrop, or the close button.
+        let cancel = modal.should_close() || closed;
 
         // The dialog owns the keyboard for the rest of the frame. Both views
         // read keys straight off the input state rather than through the focus,
@@ -2952,6 +3008,21 @@ mod tests {
         // Characters, not bytes. A byte offset would put the caret eight
         // characters along a name that is only four long.
         assert_eq!(caret_before_ext("клип.mp4"), 4);
+    }
+
+    /// The space the dialog opens on: worked in before the extension, once.
+    #[test]
+    fn the_seed_name_holds_a_space_before_the_extension() {
+        assert_eq!(seed_rename_name("clip.mp4"), "clip .mp4");
+        // The last dot, so the space lands before the real extension.
+        assert_eq!(seed_rename_name("a.b.mp4"), "a.b .mp4");
+        // A space already there is not doubled.
+        assert_eq!(seed_rename_name("clip .mp4"), "clip .mp4");
+        // Nothing to hold the space away from: left untouched.
+        assert_eq!(seed_rename_name("clip"), "clip");
+        assert_eq!(seed_rename_name(".gitignore"), ".gitignore");
+        // The caret then opens on that space, right before the dot.
+        assert_eq!(caret_before_ext(&seed_rename_name("clip.mp4")), 5);
     }
 
     /// An `App` sitting on a finished grid for a real file, which is what
