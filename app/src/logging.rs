@@ -20,7 +20,13 @@ const LOG_NAME: &str = "footage_viewer.log";
 /// How many previous runs to keep alongside the current log. Each start shifts
 /// the existing files up by one (`footage_viewer.log` -> `footage_viewer.1.log`
 /// -> ...) and drops the oldest, so the folder never grows without bound.
-const KEEP_PREVIOUS: usize = 4;
+///
+/// Twenty runs in all, up from the five ADR-0008 shipped with (see ADR-0013).
+/// Five turned out to be less than a day of use: the app is opened per clip
+/// rather than left running, so a problem worth reporting had usually rotated
+/// away by the time it was described. Logs are small (tens of KB a run), so the
+/// folder stays trivial either way.
+const KEEP_PREVIOUS: usize = 19;
 
 struct FileLogger {
     file: Mutex<File>,
@@ -84,8 +90,9 @@ pub fn init() -> PathBuf {
 }
 
 /// Directory holding the executable, where the log is written. Falls back to the
-/// current directory if the executable path can't be resolved.
-fn log_dir() -> PathBuf {
+/// current directory if the executable path can't be resolved. Also where the
+/// clip dataset goes (see `stats.rs`), so a tester has one place to collect from.
+pub fn log_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -143,7 +150,7 @@ fn payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Current UTC time as `YYYY-MM-DD HH:MM:SS.mmmZ`. Hand-rolled so logging pulls
 /// in no date/time dependency; UTC keeps it unambiguous across machines.
-fn utc_timestamp() -> String {
+pub fn utc_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -189,5 +196,33 @@ mod tests {
         assert_eq!(log_path(dir, 0), dir.join("footage_viewer.log"));
         assert_eq!(log_path(dir, 1), dir.join("footage_viewer.1.log"));
         assert_eq!(log_path(dir, 4), dir.join("footage_viewer.4.log"));
+        assert_eq!(
+            log_path(dir, KEEP_PREVIOUS),
+            dir.join("footage_viewer.19.log")
+        );
+    }
+
+    /// Rotation keeps exactly `KEEP_PREVIOUS` previous runs and drops what falls
+    /// off the end — the property the folder's boundedness rests on.
+    #[test]
+    fn rotation_shifts_runs_up_and_drops_the_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+
+        // One run past what is kept, so the oldest is due to be dropped.
+        for n in 0..=KEEP_PREVIOUS {
+            fs::write(log_path(dir, n), format!("run {n}")).unwrap();
+        }
+        rotate(dir);
+
+        // Slot 0 is free for the run starting now.
+        assert!(!log_path(dir, 0).exists(), "current log was not moved aside");
+        // Every kept run moved up exactly one slot. The last of these is also what
+        // says the oldest was dropped: slot KEEP_PREVIOUS now holds the run before
+        // it, so `run 19` survives nowhere.
+        for n in 1..=KEEP_PREVIOUS {
+            let body = fs::read_to_string(log_path(dir, n)).unwrap();
+            assert_eq!(body, format!("run {}", n - 1), "slot {n} holds the wrong run");
+        }
     }
 }

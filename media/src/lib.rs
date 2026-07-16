@@ -346,6 +346,51 @@ struct GridProfile {
     bytes: u64,
     key_bytes: u64,
     keyframes: u32,
+    /// Video packets demuxed, keyframe or not — the denominator behind the
+    /// keyframe share and the frame counts in [`Self::gop_frames`].
+    packets: u32,
+    /// Keyframe spacing in frames: what decoding forward from a keyframe to a
+    /// target costs.
+    gop_frames: Spread,
+    /// Keyframe spacing in seconds: how far back a seek to an arbitrary time
+    /// lands. Tracked apart from the frame count because the two only agree at a
+    /// constant frame rate.
+    gop_s: Spread,
+    /// Whether the decoder libav actually used was the GPU, known once a frame
+    /// has come back. `None` if the pass produced none.
+    from_gpu: Option<bool>,
+}
+
+/// Min/mean/max of a quantity sampled repeatedly across a pass.
+///
+/// Both ends matter, not just the mean: [`KeyframeSampler`] assumes a
+/// near-constant GOP and derives its skip factor from the *first* interval
+/// alone, so footage whose min and max disagree is exactly the footage that
+/// assumption is wrong for.
+#[derive(Default)]
+struct Spread {
+    min: f64,
+    max: f64,
+    sum: f64,
+    n: u32,
+}
+
+impl Spread {
+    fn add(&mut self, v: f64) {
+        self.min = if self.n == 0 { v } else { self.min.min(v) };
+        self.max = self.max.max(v);
+        self.sum += v;
+        self.n += 1;
+    }
+
+    /// Mean of the samples, or `0.0` with nothing sampled.
+    fn mean(&self) -> f64 {
+        if self.n > 0 {
+            self.sum / self.n as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 impl GridProfile {
@@ -362,6 +407,19 @@ impl GridProfile {
             bytes: 0,
             key_bytes: 0,
             keyframes: 0,
+            packets: 0,
+            gop_frames: Spread::default(),
+            gop_s: Spread::default(),
+            from_gpu: None,
+        }
+    }
+
+    /// Bytes read per second of demuxing, or `0.0` if nothing was read.
+    fn read_mb_s(&self) -> f64 {
+        if self.demux_ms > 0.0 {
+            (self.bytes as f64 / 1e6) / (self.demux_ms / 1000.0)
+        } else {
+            0.0
         }
     }
 
@@ -369,11 +427,7 @@ impl GridProfile {
     /// a complete one, so a partial `kept` count doesn't read as a finished grid.
     fn log(&self, kept: usize, cancelled: bool) {
         let mb = self.bytes as f64 / 1e6;
-        let read_mb_s = if self.demux_ms > 0.0 {
-            mb / (self.demux_ms / 1000.0)
-        } else {
-            0.0
-        };
+        let read_mb_s = self.read_mb_s();
         log::info!(
             "grid {}: kept {kept}/{} keyframes | total {:.0}ms | open {:.0}ms | setup {:.0}ms | \
              demux {:.0}ms ({mb:.1} MB, {read_mb_s:.0} MB/s) | decode {:.0}ms | convert {:.0}ms | \
@@ -390,6 +444,77 @@ impl GridProfile {
             100.0 * self.key_bytes as f64 / self.bytes.max(1) as f64,
         );
     }
+}
+
+/// What one grid pass learned about the clip it read: what the file is, how its
+/// keyframes are laid out, and what reading it cost on this machine.
+///
+/// All of it falls out of work the pass does anyway — it demuxes the clip end to
+/// end and looks at every packet — so collecting it costs no extra read. The app
+/// appends one record per pass to a file it keeps across runs (see
+/// `app/src/stats.rs` and `docs/adr/0013`).
+///
+/// The point is the tuning constants above. [`HW_MIN_PIXELS`],
+/// [`FORWARD_SCRUB_LIMIT_S`], [`SCRUB_CACHE_BYTES`] and the grid's spacing are
+/// each set against assumptions about the material — its resolution, codec, and
+/// above all its GOP length, since that alone decides how many frames a seek to
+/// an arbitrary time must decode. Those assumptions currently rest on the dev
+/// fixtures and one tester's log. This turns the footage the tool is actually
+/// pointed at into the evidence for them instead.
+pub struct ClipStats {
+    /// File name only, not the path: what the record is about, without carrying
+    /// the tester's folder layout into a file they may send on.
+    pub file: String,
+    pub size_bytes: u64,
+    /// Container as libav names it, e.g. `mov,mp4,m4a,3gp,3g2,mj2`.
+    pub container: String,
+    pub codec: String,
+    /// Codec profile as libav names it, e.g. `H264(High)` — with `level`, this is
+    /// what decides whether a GPU can take the clip at all.
+    pub profile: String,
+    pub level: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Source pixel format, e.g. `yuv420p10le`. Carries the bit depth and
+    /// chroma subsampling, which set both the decode cost and whether the
+    /// hardware path can be used.
+    pub pix_fmt: String,
+    /// Average frame rate the container declares, or `0.0` if it declares none.
+    pub fps: f64,
+    pub duration_s: f64,
+    /// Video bitrate measured over the whole pass (every packet was weighed), not
+    /// the container's claim. Audio and container overhead are excluded, so this
+    /// is what the decoder is fed; `size_bytes` covers what the disk must deliver.
+    pub video_mbit_s: f64,
+    /// Whether the decoder reports reordered frames, i.e. the stream has B-frames.
+    pub has_b_frames: bool,
+    pub packets: u32,
+    pub keyframes: u32,
+    /// Keyframe spacing in frames — min/mean/max across the clip. A spread here
+    /// means a variable GOP, which the grid's sampler does not expect.
+    pub gop_frames_min: f64,
+    pub gop_frames_mean: f64,
+    pub gop_frames_max: f64,
+    /// Keyframe spacing in seconds — min/mean/max across the clip.
+    pub gop_s_min: f64,
+    pub gop_s_mean: f64,
+    pub gop_s_max: f64,
+    /// What share of the stream's bytes the keyframes are. Bounds what a
+    /// seek-per-keyframe grid could save over this pass, which reads everything
+    /// and drops all but these.
+    pub key_share_pct: f64,
+    /// Whether libav decoded on the GPU. A *request* is made for anything over
+    /// [`HW_MIN_PIXELS`], but libav silently stays on the CPU when the codec has
+    /// no hardware config, so only this says what actually happened.
+    pub hw_decode: bool,
+    pub grid_ms: f64,
+    pub open_ms: f64,
+    pub setup_ms: f64,
+    pub demux_ms: f64,
+    pub decode_ms: f64,
+    pub convert_ms: f64,
+    /// Demux throughput, which is what tells a slow disk apart from a slow decode.
+    pub read_mb_s: f64,
 }
 
 /// Clip metadata, reported once before any thumbnail.
@@ -468,12 +593,16 @@ impl KeyframeSampler {
 /// not known up front. Thumbnails fit into a box whose long side is
 /// `thumb_long_side`, preserving aspect.
 ///
-/// Setting `cancel` abandons the pass, which then returns `Ok(())` having emitted
-/// only the thumbnails produced so far. It is read once per demuxed packet,
-/// because reading the file — not decoding it — is what a caller needs stopped:
-/// this pass demuxes the clip end to end, and on the external HDD the target
-/// archive lives on that is seconds of head time, which a worker nobody listens
-/// to would otherwise steal from the clip the user is waiting for.
+/// A whole pass returns what it learned about the clip ([`ClipStats`]); a pass
+/// that was cancelled returns `None`, since a record of a partly-read file would
+/// read as a short clip with few keyframes rather than as the fragment it is.
+///
+/// Setting `cancel` abandons the pass, which then returns `Ok(None)` having
+/// emitted only the thumbnails produced so far. It is read once per demuxed
+/// packet, because reading the file — not decoding it — is what a caller needs
+/// stopped: this pass demuxes the clip end to end, and on the external HDD the
+/// target archive lives on that is seconds of head time, which a worker nobody
+/// listens to would otherwise steal from the clip the user is waiting for.
 pub fn extract_grid_streaming(
     path: &Path,
     spacing_s: f64,
@@ -481,7 +610,7 @@ pub fn extract_grid_streaming(
     cancel: &AtomicBool,
     mut on_meta: impl FnMut(GridMeta),
     mut on_thumb: impl FnMut(usize, Thumbnail),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ClipStats>> {
     let t0 = Instant::now();
     let mut ictx = input(path)?;
     let mut profile = GridProfile::new(t0);
@@ -500,11 +629,26 @@ pub fn extract_grid_streaming(
         _ => 0.0,
     };
 
+    // Average frame rate, read while the stream is still borrowed. Zero when the
+    // container declares none.
+    let fps = match stream.avg_frame_rate() {
+        r if r.numerator() > 0 && r.denominator() > 0 => {
+            r.numerator() as f64 / r.denominator() as f64
+        }
+        _ => 0.0,
+    };
+
     let mut decoder_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-    // Frame size before the decoder is opened, to decide on hardware decode.
-    let (src_w, src_h) = unsafe {
+    // Frame size before the decoder is opened, to decide on hardware decode. The
+    // pixel format is taken here too: once a hardware decoder is attached, frames
+    // come back as `D3D11` and the source format is no longer visible on them.
+    let (src_w, src_h, src_pix_fmt) = unsafe {
         let c = decoder_ctx.as_mut_ptr();
-        ((*c).width as u32, (*c).height as u32)
+        (
+            (*c).width as u32,
+            (*c).height as u32,
+            Pixel::from((*c).pix_fmt),
+        )
     };
     // Decode across all cores. Frame-level threading is the biggest speedup for
     // H.264/HEVC (count 0 auto-detects the logical CPU count); the few frames of
@@ -540,8 +684,23 @@ pub fn extract_grid_streaming(
         src_h,
     });
 
+    // The clip's own facts, for the record this pass returns. Read here because
+    // demuxing below borrows `ictx` for the rest of the function.
+    let container = ictx.format().name().to_owned();
+    let file = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
     let mut next_index = 0usize;
     let mut sampler = KeyframeSampler::new(spacing_s);
+    // Where the last keyframe sat, to measure the gap to the next one. Kept apart
+    // because a packet may carry no timestamp, which costs that gap its seconds
+    // but not its frame count.
+    let mut last_key_packet: Option<u32> = None;
+    let mut last_key_s: Option<f64> = None;
 
     // Advance the packet iterator by hand rather than with `for`, so the time the
     // demuxer spends reading the file is measured apart from the decode it feeds.
@@ -549,7 +708,7 @@ pub fn extract_grid_streaming(
     loop {
         if cancel.load(Ordering::Relaxed) {
             profile.log(next_index, true);
-            return Ok(());
+            return Ok(None);
         }
         let read_start = Instant::now();
         let next = packets.next();
@@ -559,12 +718,27 @@ pub fn extract_grid_streaming(
             continue;
         }
         profile.bytes += packet.size() as u64;
+        profile.packets += 1;
         // Send only keyframe packets; everything between them is skipped entirely.
         if !packet.is_key() {
             continue;
         }
         profile.key_bytes += packet.size() as u64;
         profile.keyframes += 1;
+        // Measure the gap back to the previous keyframe, which is the whole shape
+        // of the clip as far as seeking is concerned (see [`ClipStats`]). Free:
+        // the pass walks every packet regardless.
+        if let Some(prev) = last_key_packet {
+            profile.gop_frames.add((profile.packets - prev) as f64);
+        }
+        last_key_packet = Some(profile.packets);
+        if let Some(key_s) = packet.pts().or_else(|| packet.dts()) {
+            let key_s = key_s as f64 * tb_secs;
+            if let Some(prev) = last_key_s {
+                profile.gop_s.add(key_s - prev);
+            }
+            last_key_s = Some(key_s);
+        }
         let decode_start = Instant::now();
         decoder.send_packet(&packet).ok();
         profile.decode_ms += millis(decode_start.elapsed());
@@ -602,7 +776,61 @@ pub fn extract_grid_streaming(
     )?;
 
     profile.log(next_index, false);
-    Ok(())
+
+    // Read off the decoder now that the whole stream has gone through it: the
+    // header may under-report `has_b_frames`, but a decoder that has reordered
+    // frames cannot.
+    let (level, has_b_frames) = unsafe {
+        let c = decoder.as_ptr();
+        ((*c).level, (*c).has_b_frames > 0)
+    };
+    Ok(Some(ClipStats {
+        file,
+        size_bytes,
+        container,
+        codec: decoder
+            .codec()
+            .map(|c| c.name().to_owned())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        profile: format!("{:?}", decoder.profile()),
+        level,
+        width: src_w,
+        height: src_h,
+        pix_fmt: pix_fmt_name(src_pix_fmt),
+        fps,
+        duration_s,
+        video_mbit_s: if duration_s > 0.0 {
+            profile.bytes as f64 * 8.0 / duration_s / 1e6
+        } else {
+            0.0
+        },
+        has_b_frames,
+        packets: profile.packets,
+        keyframes: profile.keyframes,
+        gop_frames_min: profile.gop_frames.min,
+        gop_frames_mean: profile.gop_frames.mean(),
+        gop_frames_max: profile.gop_frames.max,
+        gop_s_min: profile.gop_s.min,
+        gop_s_mean: profile.gop_s.mean(),
+        gop_s_max: profile.gop_s.max,
+        key_share_pct: 100.0 * profile.key_bytes as f64 / profile.bytes.max(1) as f64,
+        hw_decode: profile.from_gpu.unwrap_or(false),
+        grid_ms: millis(profile.start.elapsed()),
+        open_ms: profile.open_ms,
+        setup_ms: profile.setup_ms,
+        demux_ms: profile.demux_ms,
+        decode_ms: profile.decode_ms,
+        convert_ms: profile.convert_ms,
+        read_mb_s: profile.read_mb_s(),
+    }))
+}
+
+/// A pixel format's libav name (`yuv420p10le`), or `"unknown"` for a stream whose
+/// header declares no format (libav then has no descriptor to name).
+fn pix_fmt_name(p: Pixel) -> String {
+    p.descriptor()
+        .map(|d| d.name().to_owned())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Drain every frame currently available from the decoder (all keyframes, since
@@ -642,7 +870,9 @@ fn drain(
                 Some(s) => s,
                 None => {
                     // First thumbnail: report which decoder actually took it (see
-                    // the matching line in play_stream).
+                    // the matching line in play_stream). Every later frame of this
+                    // pass takes the same path, so recording it once is enough.
+                    profile.from_gpu = Some(from_gpu);
                     log::info!(
                         "grid: {}x{} ({:.1} MP), decoding on the {}, frames as {:?}",
                         src_w,
@@ -681,7 +911,9 @@ fn frame_pts(frame: &Video) -> i64 {
 pub fn extract_grid(path: &Path, spacing_s: f64, thumb_long_side: u32) -> anyhow::Result<Grid> {
     let mut meta: Option<GridMeta> = None;
     let mut thumbs = Vec::new();
-    extract_grid_streaming(
+    // The clip's stats go unused here: only the app keeps them, and it takes the
+    // streaming path.
+    let _ = extract_grid_streaming(
         path,
         spacing_s,
         thumb_long_side,
@@ -1523,6 +1755,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Run a whole pass over `name` purely for the stats it reports.
+    fn stats_of(name: &str) -> ClipStats {
+        init().unwrap();
+        extract_grid_streaming(
+            &test_video(name),
+            1.0,
+            320,
+            &AtomicBool::new(false),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap()
+        .expect("a whole pass reports stats")
+    }
+
+    /// A pass reports the clip's keyframe layout, which is the whole reason the
+    /// stats exist: how far apart keyframes sit is what a seek to an arbitrary
+    /// time costs. Pinned against the 4K fixture's known build (8 s, 25 fps,
+    /// `-g 12` — see `test_videos/generate.sh`), so the measurement is checked
+    /// against the material rather than against itself.
+    #[test]
+    fn stats_report_the_keyframe_layout() {
+        let s = stats_of("camera_8s_4k.mp4");
+
+        assert_eq!((s.width, s.height), (3840, 2160));
+        assert_eq!(s.codec, "h264");
+        assert_eq!(s.file, "camera_8s_4k.mp4");
+        assert!(s.size_bytes > 0, "file size not read");
+        assert!((s.fps - 25.0).abs() < 0.01, "fps was {}", s.fps);
+
+        // `-g 12` at 25 fps: a keyframe every 12 frames, i.e. every 0.48 s.
+        assert!(
+            (s.gop_frames_mean - 12.0).abs() < 0.5,
+            "GOP of {:.1} frames, expected ~12",
+            s.gop_frames_mean
+        );
+        assert!(
+            (s.gop_s_mean - 0.48).abs() < 0.02,
+            "GOP of {:.3}s, expected ~0.48",
+            s.gop_s_mean
+        );
+        // A fixed GOP: the interval never varies, which is what the grid's
+        // sampler assumes and what a real clip may well break.
+        assert_eq!(
+            s.gop_frames_min, s.gop_frames_max,
+            "fixed-GOP fixture reported a spread"
+        );
+
+        // Every packet was weighed, and the keyframes are a subset of them.
+        assert_eq!(s.packets, 200, "8 s at 25 fps is 200 packets");
+        assert!(
+            s.keyframes > 0 && s.keyframes < s.packets,
+            "{} keyframes of {} packets",
+            s.keyframes,
+            s.packets
+        );
+        assert!(
+            s.key_share_pct > 0.0 && s.key_share_pct < 100.0,
+            "keyframes are {:.1}% of the stream",
+            s.key_share_pct
+        );
+        assert!(s.video_mbit_s > 0.0, "no bitrate measured");
+    }
+
+    /// The all-intra fixture is the degenerate layout: every frame is a keyframe,
+    /// so the GOP is one frame and a seek never decodes forward at all. It is the
+    /// far end of the range the stats must describe, and it catches an off-by-one
+    /// in the gap measurement that a 12-frame GOP would hide.
+    #[test]
+    fn stats_report_an_all_intra_layout() {
+        let s = stats_of("allintra_4s_240p.mp4");
+
+        assert_eq!(s.keyframes, s.packets, "not every frame is a keyframe");
+        assert_eq!(s.gop_frames_min, 1.0);
+        assert_eq!(s.gop_frames_max, 1.0);
+        assert!(
+            (s.key_share_pct - 100.0).abs() < 0.01,
+            "all-intra stream is {:.1}% keyframes",
+            s.key_share_pct
+        );
+        // Small frames stay on the CPU (see HW_MIN_PIXELS), and the record must
+        // say so rather than report the request that was never made.
+        assert!(!s.hw_decode, "240p should not have gone to the GPU");
+    }
+
+    /// A cancelled pass reports nothing. Its counts describe the fragment it read,
+    /// not the clip, and a record of one would enter the dataset as a short file
+    /// with few keyframes — indistinguishable from real footage of that shape.
+    #[test]
+    fn a_cancelled_pass_reports_no_stats() {
+        init().unwrap();
+        let stats = extract_grid_streaming(
+            &test_video("camera_8s_4k.mp4"),
+            1.0,
+            320,
+            &AtomicBool::new(true),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert!(stats.is_none(), "a cancelled pass reported stats");
     }
 
     /// Setting the cancel flag mid-pass stops it early instead of reading the file

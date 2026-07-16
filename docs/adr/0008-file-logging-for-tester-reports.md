@@ -29,6 +29,10 @@ read-only, logging is skipped and the app runs unchanged.
 and the oldest is dropped. This preserves the "it worked last time" run without
 letting the folder grow without bound.
 
+> Revised by ADR-0013: the rotation now keeps twenty runs, five having proved
+> shorter than the gap between a bad run and its report. The mechanism is
+> unchanged.
+
 **Roll our own `log::Log` sink rather than add a logger crate.** The `log` facade
 is already in the tree (eframe/wgpu depend on it), so declaring it directly adds
 nothing to download — important because the maintainer builds locally and an

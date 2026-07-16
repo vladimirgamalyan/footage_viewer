@@ -20,6 +20,7 @@ use eframe::egui;
 use footage_viewer_media as media;
 
 mod logging;
+mod stats;
 
 const THUMB_SPACING_S: f64 = 1.0;
 const THUMB_LONG: u32 = 320;
@@ -1778,7 +1779,14 @@ fn spawn_extraction(ctx: &egui::Context, path: PathBuf) -> Loaded {
             },
         );
         let _ = match result {
-            Ok(()) => tx.send(Msg::Done),
+            Ok(s) => {
+                // Every whole pass — a clip opened or read ahead — adds a line to
+                // the dataset. A cancelled one reports `None` and adds nothing.
+                if let Some(s) = s {
+                    stats::record(&s);
+                }
+                tx.send(Msg::Done)
+            }
             Err(e) => tx.send(Msg::Err(format!("{e:#}"))),
         };
         ctx_end.request_repaint();
