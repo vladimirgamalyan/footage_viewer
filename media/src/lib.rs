@@ -59,6 +59,19 @@ const FORWARD_SCRUB_LIMIT_S: f64 = 2.0;
 /// for stepping across a stretch.
 const SCRUB_CACHE_BYTES: usize = 128 << 20;
 
+/// Frames a [`PaceReport`] must cover before it says anything. A verdict drawn
+/// from two frames is noise, not data: the first frames after a play start or a
+/// rescale carry one-time costs a steady stretch doesn't — building the scaler,
+/// the first texture upload — and the box playback opens at lives for one repaint
+/// before the view replaces it (see `PLAYBACK_LONG_START` in the app).
+const PACE_MIN_FRAMES: u32 = 10;
+
+/// Frames after which a [`PaceReport`] reports without waiting for the stretch to
+/// end. The stretch a tester cares about is usually the one still running when
+/// they close the app, and an exit that doesn't unwind the decode thread would
+/// take it with it. ~4 s of 25 fps playback, so a clip yields a handful of lines.
+const PACE_FLUSH_FRAMES: u32 = 100;
+
 /// Log a one-line timing breakdown for each live seek (Scrub/Play), to diagnose
 /// scrub latency on a tester's footage. Flip to `false` to silence it.
 const LOG_SCRUB_TIMING: bool = true;
@@ -388,6 +401,83 @@ struct SeekProfile {
     seek_ms: f64,
     decoded: u32,
     decode_ms: f64,
+}
+
+/// Frames that missed their slot at one output box, reported when the box changes
+/// or playback ends.
+///
+/// This is the one number that says whether a machine keeps real time with a
+/// zoomed-in clip, which `docs/adr/0014` decided on this machine's evidence alone:
+/// here a 4K clip holds pace at every box up to 1:1, but the footage this tool
+/// targets is 4K30 on a GTX 1070 — a 33 ms budget where this had 40, on hardware
+/// ADR-0012 measured ~1.8x slower. Only a log from that machine can settle it, and
+/// what it settles is whether the decoder should scale the visible crop instead of
+/// the whole frame (rejected as unnecessary, on this machine's numbers).
+///
+/// A frame counts as late when its slot has already passed by the time the decoder
+/// reaches the pacing wait, which catches both ways this can fail. A scale too slow
+/// to feed real time is the obvious one. A UI too slow to drain the frame channel
+/// is the other, and it lands here too: a full channel blocks the emit, so the next
+/// frame inherits the delay and misses its own slot. The scale and the texture
+/// upload it feeds are exactly what a crop would cut.
+///
+/// Reported per box rather than per clip because that is the comparison worth
+/// having — the same playback at fit and at 1:1, on their machine.
+struct PaceReport {
+    out_w: u32,
+    out_h: u32,
+    frames: u32,
+    late: u32,
+    worst_ms: f64,
+}
+
+impl PaceReport {
+    fn new() -> Self {
+        Self {
+            out_w: 0,
+            out_h: 0,
+            frames: 0,
+            late: 0,
+            worst_ms: 0.0,
+        }
+    }
+
+    /// Report the stretch just played and start a new one. Silent below
+    /// [`PACE_MIN_FRAMES`], so a rescale storm and the warmup box don't fill the
+    /// log with verdicts drawn from a frame or two.
+    fn flush(&mut self) {
+        if self.frames >= PACE_MIN_FRAMES {
+            if self.late > 0 {
+                log::info!(
+                    "playback: {}x{} box | {} frames | {} late, worst {:.0}ms behind",
+                    self.out_w,
+                    self.out_h,
+                    self.frames,
+                    self.late,
+                    self.worst_ms,
+                );
+            } else {
+                log::info!(
+                    "playback: {}x{} box | {} frames | none late",
+                    self.out_w,
+                    self.out_h,
+                    self.frames,
+                );
+            }
+        }
+        self.frames = 0;
+        self.late = 0;
+        self.worst_ms = 0.0;
+    }
+}
+
+impl Drop for PaceReport {
+    /// Report the last stretch however playback ended — `Stop`, end of stream, a
+    /// closed channel or an error all leave `play_stream` by their own path, and
+    /// the interesting stretch is usually the one still running when they do.
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 /// Timing and byte counts for one grid pass, accumulated as it runs and logged
@@ -1102,6 +1192,8 @@ pub fn play_stream(
     let mut cache = ScrubCache::new(frame_dur_s);
     // Timing for the in-flight live seek, logged when its frame lands.
     let mut profile: Option<SeekProfile> = None;
+    // Whether this machine keeps real time at the box the UI is asking for.
+    let mut pace = PaceReport::new();
 
     loop {
         // Fold in every command already queued before acting on any of them. A drag
@@ -1130,6 +1222,11 @@ pub fn play_stream(
             out = Some((out_w, out_h));
             scaler = None;
             cache.clear();
+            // Close the old box's pacing report before the new box starts feeding
+            // it, so the two are comparable rather than averaged together.
+            pace.flush();
+            pace.out_w = out_w;
+            pace.out_h = out_h;
         }
 
         // A precise move (Scrub/Play) just started: open a timing profile for it,
@@ -1285,8 +1382,8 @@ pub fn play_stream(
                 // Wait until the frame is due, but let a command preempt the wait
                 // (dropping this frame — the command seeks or pauses anyway).
                 let mut preempted = false;
-                if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                    match commands.recv_timeout(wait) {
+                match due.checked_duration_since(Instant::now()) {
+                    Some(wait) => match commands.recv_timeout(wait) {
                         Ok(cmd) => {
                             if !st.apply(cmd) {
                                 return Ok(());
@@ -1295,6 +1392,13 @@ pub fn play_stream(
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    },
+                    // The slot has already passed: this machine is not keeping real
+                    // time at this box — see [`PaceReport`]. The frame still goes
+                    // out, late, which is what playing behind looks like.
+                    None => {
+                        pace.late += 1;
+                        pace.worst_ms = pace.worst_ms.max(millis(Instant::now() - due));
                     }
                 }
                 if preempted {
@@ -1339,6 +1443,10 @@ pub fn play_stream(
             }
         };
         let t = scale_thumb(scaler, &frame, out_w, out_h, time_s)?;
+        pace.frames += 1;
+        if pace.frames >= PACE_FLUSH_FRAMES {
+            pace.flush();
+        }
         // Hold the frames a scrub lands on: a scrub walks back over its own
         // ground constantly, and this one is scaled and paid for already.
         if st.hold_after {

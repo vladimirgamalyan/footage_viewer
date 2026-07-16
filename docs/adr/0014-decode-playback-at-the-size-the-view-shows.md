@@ -123,7 +123,20 @@ the rescale exists to remove, on precisely the frames a scrub walks back over.
   leave the newly exposed edges black until a re-scale lands. That is a certain
   regression on the one gesture a zoom exists for, bought against a speculative
   one. It would also make `ScrubCache`'s frames view-specific, which ADR-0012 did
-  not intend. Revisit if a tester's log shows drops while playing zoomed in.
+  not intend.
+- **The machine that decides it now reports itself.** All of the above rests on
+  measurements from this machine, and the footage this tool targets is 4K30 on a
+  GTX 1070 — a 33 ms budget where this had 40, on hardware ADR-0012 measured ~1.8×
+  slower. So `PaceReport` logs one line per box per stretch of playback, e.g.
+  `playback: 3840x2160 box | 100 frames | none late`, counting frames whose slot
+  had already passed when the decoder reached the pacing wait. That one number
+  catches both failure modes: a scale too slow to feed real time, and a UI too slow
+  to drain the frame channel — a full channel blocks the emit, so the next frame
+  inherits the delay and misses its own slot. It reports progressively rather than
+  only when playback ends, because the stretch that matters is the one running when
+  the app is closed. This machine says `none late` at every box up to 1:1. If the
+  GTX 1070 does not, the crop comes back with evidence behind it rather than an
+  arithmetic guess (ADR-0008 is why the log is the instrument).
 - **A zoom sharpens a beat late.** The frame on screen keeps the old scale until
   the re-land arrives — one precise seek, ~30 ms on 4K per ADR-0009. Scaling in
   the decoder is what makes that unavoidable.
