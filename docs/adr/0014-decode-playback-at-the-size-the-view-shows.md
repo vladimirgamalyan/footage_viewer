@@ -95,15 +95,35 @@ the rescale exists to remove, on precisely the frames a scrub walks back over.
   resolution regardless would cost another 2.4× on top, on every frame, to look
   identical at fit — and 16× on a small window, where the fit box is ~1000 px.
   That is the cost this decision declines to pay.
-- **Zoomed-in playback is the case that costs, and it is unmeasured.** A 4K frame
-  at 1:1 is ~33 MB of RGBA against ~5.8 MB at fit, and swscale, the channel and
-  the texture upload all scale with it. Fit is unchanged and needs no measurement;
-  playing *while zoomed in* on the tester's GTX 1070 (ADR-0009, ADR-0012) may drop
-  frames. Scrubbing and stills while zoomed — what a zoom is actually for — pay it
-  once per frame looked at. If it bites, the fix is to scale only the visible crop
-  instead of the whole frame: at 1:1 the window shows ~17% of a 4K frame, so the
-  cost would go flat rather than rise with the zoom. That is a larger change and
-  should wait for evidence.
+- **Zoomed-in playback holds pace.** Measured on the real app, fullscreen, this
+  machine, `camera_8s_4k.mp4` (25 fps, so a 40 ms budget): at the 1:1 cap, 104
+  frames at a **40.4 ms mean interval with not one frame skipped** — the decoder
+  never queued a second frame behind the one on screen. Fit, at 2484, gives the
+  same 40.2 ms. Full-resolution playback is not the wall the old box's comment
+  implied.
+- **What the zoom costs is the texture path**, timed around
+  `ColorImage::from_rgba_unmultiplied` and the upload that follows it:
+
+  | box | per frame | of a 40 ms budget |
+  |---|---|---|
+  | 2484 (fit) | 3.43 ms | 9% |
+  | 3106 | 5.35 ms | 13% |
+  | 3840 (the cap) | 8.08 ms | 20% |
+
+  It tracks the pixels, as it should, and 20% is affordable. The tester's GTX 1070
+  on 4K30 has a 33 ms budget and ADR-0012 measured it ~1.8× slower than here, which
+  would put this near 14 ms — tighter, not a wall. Unmeasured on that machine.
+- **Scaling only the visible crop was considered and declined.** It would flatten
+  the cost across the zoom rather than let it rise to 8 ms. Three things sank it.
+  The frame already plays at pace at 1:1, so it fixes nothing that is broken. A
+  fullscreen window shows **43%** of a 4K frame at the cap — a 2.3× saving, not the
+  ~6× a small window suggests, and any pan margin worth having eats most of it
+  back. And cropping in the decoder makes **panning a decoder round-trip**: today
+  the whole frame sits in the texture and a drag is instant, where a crop would
+  leave the newly exposed edges black until a re-scale lands. That is a certain
+  regression on the one gesture a zoom exists for, bought against a speculative
+  one. It would also make `ScrubCache`'s frames view-specific, which ADR-0012 did
+  not intend. Revisit if a tester's log shows drops while playing zoomed in.
 - **A zoom sharpens a beat late.** The frame on screen keeps the old scale until
   the re-land arrives — one precise seek, ~30 ms on 4K per ADR-0009. Scaling in
   the decoder is what makes that unavoidable.
