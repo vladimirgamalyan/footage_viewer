@@ -46,11 +46,17 @@ const FORWARD_SCRUB_LIMIT_S: f64 = 2.0;
 /// Memory [`ScrubCache`] may hold, in bytes.
 ///
 /// Sized in bytes rather than frames because a frame's cost is set by the
-/// playback box, not the source: at the UI's 1600 px box a 4K clip scales to
+/// playback box, not the source, and that box follows the zoom (see
+/// [`PlayCommand::SetLongSide`]): at a typical window's fit a 4K clip scales to
 /// ~5.8 MB per frame, so this keeps ~22 of them — around 11 s of A/D stepping,
 /// which covers the back-and-forth a real session does over one stretch. Smaller
 /// footage scales to less and so gets proportionally more frames for the same
 /// memory, which is what we want: those clips are scrubbed the same way.
+///
+/// Zoomed to 1:1 that same 4K frame is ~33 MB and only ~3 fit, so scrubbing while
+/// zoomed in falls back to decoding much sooner — and a rescale empties the cache
+/// outright. Both are the right way round: a zoom is for studying one frame, not
+/// for stepping across a stretch.
 const SCRUB_CACHE_BYTES: usize = 128 << 20;
 
 /// Log a one-line timing breakdown for each live seek (Scrub/Play), to diagnose
@@ -88,13 +94,21 @@ pub struct Thumbnail {
     pub rgba: Vec<u8>,
 }
 
-/// One decoded frame for playback: an RGBA image scaled to fit the playback box
-/// and its presentation time relative to the stream start (same timeline as a
-/// [`Thumbnail`]'s `time_s`).
+/// One decoded frame for playback: an RGBA image scaled to fit the box the UI
+/// last asked for (see [`PlayCommand::SetLongSide`]) and its presentation time
+/// relative to the stream start (same timeline as a [`Thumbnail`]'s `time_s`).
+///
+/// `src_w`/`src_h` describe the source, not this image: the scale changes as the
+/// UI zooms, so `width`/`height` say nothing about how large the frame being
+/// looked at actually is. Carrying the source size on every frame is also what
+/// keeps the UI's layout from chasing its own tail — the box it asks for is
+/// derived from the source, never from the image that box produced.
 pub struct PlaybackFrame {
     pub time_s: f64,
     pub width: u32,
     pub height: u32,
+    pub src_w: u32,
+    pub src_h: u32,
     pub rgba: Vec<u8>,
 }
 
@@ -110,6 +124,17 @@ pub enum PlayCommand {
     Pause,
     /// Resume playing from the current position.
     Resume,
+    /// Scale later frames to fit a box whose long side is this many pixels,
+    /// capped at the source's own long side — scaling past it would only invent
+    /// pixels the file never had.
+    ///
+    /// This is what lets a zoom reach the source's real detail. Frames are scaled
+    /// once, in the decoder, so the size asked for here is the ceiling on what any
+    /// zoom can show: ask for the fit size and a zoom magnifies an image that was
+    /// already resampled down. The UI therefore asks for exactly what its view
+    /// currently displays, and pays for the pixels it is showing rather than for
+    /// the ones it might show if the user zoomed.
+    SetLongSide(u32),
     /// End playback; `play_stream` returns `Ok(())`.
     Stop,
 }
@@ -133,6 +158,9 @@ struct PlayState {
     /// When the in-flight Scrub/Play began; the decode loop takes it to time that
     /// move's landing latency (see [`LOG_SCRUB_TIMING`]).
     move_start: Option<Instant>,
+    /// Long side of the box frames are scaled into, as last asked for by
+    /// [`PlayCommand::SetLongSide`]. The decode loop watches this for changes.
+    long_side: u32,
 }
 
 impl PlayState {
@@ -146,9 +174,35 @@ impl PlayState {
                 self.paused = false;
                 self.anchor = None;
             }
+            PlayCommand::SetLongSide(long) => self.set_long_side(long),
             PlayCommand::Stop => return false,
         }
         true
+    }
+
+    /// Take a new output scale, and re-land on the held frame when there is one.
+    ///
+    /// A held frame is the case that needs the work: nothing will decode it again,
+    /// so it would stay on screen at the old scale until something else moved the
+    /// decoder — soft at the exact moment the user zoomed in to look closer. While
+    /// playing there is nothing to do, since every following frame is scaled on the
+    /// way out anyway.
+    ///
+    /// The re-land is a full seek rather than a [`start_move`](Self::start_move) to
+    /// `current_s`: that would skip forward from where the decoder stands and hand
+    /// back the *next* frame, and the frame being zoomed into is this one.
+    fn set_long_side(&mut self, long: u32) {
+        if long == self.long_side {
+            return;
+        }
+        self.long_side = long;
+        if self.paused {
+            self.pending_seek = Some((self.current_s, true));
+            self.skip_until = None;
+            self.hold_after = true;
+            self.paused = false;
+            self.anchor = None;
+        }
     }
 
     /// Begin a precise move to `t`, holding on the landed frame when `hold`. A
@@ -310,6 +364,17 @@ impl ScrubCache {
                 None => break,
             }
         }
+    }
+
+    /// Drop every held frame, because they are all scaled to one output size and
+    /// a rescale (see [`PlayCommand::SetLongSide`]) just made that the wrong one.
+    ///
+    /// Serving them past that point would put a frame carrying the old scale's
+    /// detail back on screen at the new one — the soft picture the rescale exists
+    /// to get rid of, and only on the frames the user happens to scrub back over.
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
     }
 }
 
@@ -940,9 +1005,11 @@ pub fn extract_grid(path: &Path, spacing_s: f64, thumb_long_side: u32) -> anyhow
 /// before `start_from_s` — see [`SEEK_BACK_US`]. Thereafter a `Scrub`/`Play`
 /// command seeks by flushing this same decoder and skipping forward to the exact
 /// target frame, so scrubbing shows precise frames without reopening the file.
-/// Frames are scaled to fit a box whose long side is `long_side`. `on_frame`
-/// returns `false` to stop (the UI closed the player); `Stop`, a closed command
-/// channel, or end-of-stream during playback also end the call with `Ok(())`.
+/// Frames are scaled to fit a box whose long side is `long_side` — the starting
+/// scale only, which [`PlayCommand::SetLongSide`] then moves as the UI zooms.
+/// `on_frame` returns `false` to stop (the UI closed the player); `Stop`, a closed
+/// command channel, or end-of-stream during playback also end the call with
+/// `Ok(())`.
 pub fn play_stream(
     path: &Path,
     start_from_s: f64,
@@ -999,12 +1066,20 @@ pub fn play_stream(
         }
     }
     let mut decoder = decoder_ctx.decoder().video()?;
-    let (out_w, out_h) = thumb_size(src_w, src_h, long_side);
+    // Scaling past the source only invents pixels, so this bounds every box the UI
+    // may ask for (see [`PlayCommand::SetLongSide`]).
+    let src_long = src_w.max(src_h);
 
     // Built on the first emitted frame, not here: with a hardware decoder the
     // frames arrive in GPU memory and their real pixel format (and the format they
-    // download to) is only known once one has been decoded.
+    // download to) is only known once one has been decoded. Dropped and rebuilt
+    // whenever the UI asks for a different scale.
     let mut scaler: Option<Scaler> = None;
+    // The output size `scaler` was built for; `None` until it has been built.
+    let mut out: Option<(u32, u32)> = None;
+    // The decode path is logged once per clip, not once per scaler — a zoom
+    // rebuilds the scaler and would otherwise repeat the line for every step.
+    let mut logged = false;
 
     let mut st = PlayState {
         paused: false,
@@ -1015,6 +1090,7 @@ pub fn play_stream(
         pending_seek: Some((start_from_s, false)),
         current_s: start_from_s,
         move_start: None,
+        long_side,
     };
     // Demux/decoder end-of-stream flags, reset on every seek.
     let mut demux_eof = false;
@@ -1043,6 +1119,17 @@ pub fn play_stream(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
+        }
+
+        // The UI asked for a scale we aren't producing (it zoomed, or its window
+        // changed): rebuild the scaler for it and drop the frames held at the old
+        // one. Done here, before the cache is read below, so a rescale cannot be
+        // answered from frames that predate it.
+        let (out_w, out_h) = thumb_size(src_w, src_h, st.long_side.min(src_long));
+        if out != Some((out_w, out_h)) {
+            out = Some((out_w, out_h));
+            scaler = None;
+            cache.clear();
         }
 
         // A precise move (Scrub/Play) just started: open a timing profile for it,
@@ -1080,6 +1167,8 @@ pub fn play_stream(
                     time_s: f.time_s,
                     width: f.width,
                     height: f.height,
+                    src_w,
+                    src_h,
                     rgba: f.rgba.clone(),
                 }) {
                     let landed_s = hit.time_s;
@@ -1227,14 +1316,17 @@ pub fn play_stream(
                 // this line is the only way to tell the two apart in a tester's log
                 // (see docs/adr/0008). Pairs with the per-seek timings below to
                 // show what the decode path costs on that machine.
-                log::info!(
-                    "playback: {}x{} ({:.1} MP), decoding on the {}, frames as {:?}",
-                    src_w,
-                    src_h,
-                    (src_w as f64 * src_h as f64) / 1e6,
-                    if from_gpu { "GPU" } else { "CPU" },
-                    frame.format(),
-                );
+                if !logged {
+                    logged = true;
+                    log::info!(
+                        "playback: {}x{} ({:.1} MP), decoding on the {}, frames as {:?}",
+                        src_w,
+                        src_h,
+                        (src_w as f64 * src_h as f64) / 1e6,
+                        if from_gpu { "GPU" } else { "CPU" },
+                        frame.format(),
+                    );
+                }
                 scaler.insert(Scaler::get(
                     frame.format(),
                     src_w,
@@ -1256,6 +1348,8 @@ pub fn play_stream(
             time_s: t.time_s,
             width: t.width,
             height: t.height,
+            src_w,
+            src_h,
             rgba: t.rgba,
         }) {
             return Ok(());
@@ -1587,6 +1681,65 @@ mod tests {
         let (t, len) = landed.expect("4K scrub did not land near 5.3s");
         assert_eq!(len, first_len, "landed frame is a different size");
         assert!((t - 5.3).abs() < 0.05, "landed at {t}, not 5.3s");
+    }
+
+    /// `SetLongSide` re-emits the frame being held, at the new scale and at the
+    /// same time — which is what a zoom onto a paused frame needs. Nothing else
+    /// would ever decode that frame again, so without the re-emit it would sit
+    /// there at the old scale: soft at the exact moment it was zoomed into.
+    ///
+    /// Asking a 4K clip for its own 3840 is what a zoom to 1:1 does, and the frame
+    /// has to come back as the source's pixels rather than the 1600-wide resample
+    /// playback opened with — the resample is what threw the detail away.
+    ///
+    /// The re-emitted frame must also be the *same* one: it lands via a full seek
+    /// precisely so it is, where skipping forward from where the decoder stands
+    /// would hand back the next frame and shift the picture under the zoom. Held
+    /// frames being dropped on a rescale is part of the same claim — a cache hit
+    /// here would answer with the old scale's pixels and fail on the size.
+    #[test]
+    fn set_long_side_re_emits_the_held_frame_at_the_new_scale() {
+        init().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel::<(f64, u32, u32, u32, u32)>();
+        let path = test_video("camera_8s_4k.mp4");
+
+        let worker = std::thread::spawn(move || {
+            play_stream(&path, 0.0, 1600, cmd_rx, |f| {
+                frame_tx
+                    .send((f.time_s, f.width, f.height, f.src_w, f.src_h))
+                    .is_ok()
+            })
+        });
+
+        frame_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("no first frame");
+
+        // Land on a frame and hold it, exactly as the UI does before a zoom.
+        cmd_tx.send(PlayCommand::Scrub(5.3)).unwrap();
+        let mut held = None;
+        while let Ok(f) = frame_rx.recv_timeout(Duration::from_secs(30)) {
+            if (f.0 - 5.3).abs() < 0.05 {
+                held = Some(f);
+                break;
+            }
+        }
+        let (held_s, held_w, _, src_w, src_h) = held.expect("scrub did not land near 5.3s");
+        assert_eq!(held_w, 1600, "playback should open at the box it was asked for");
+
+        cmd_tx.send(PlayCommand::SetLongSide(src_w)).unwrap();
+        let (time_s, w, h, _, _) = frame_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the held frame was never re-emitted");
+        cmd_tx.send(PlayCommand::Stop).unwrap();
+        worker.join().unwrap().unwrap();
+
+        assert_eq!((w, h), (src_w, src_h), "re-emitted below the source's resolution");
+        assert!(
+            (time_s - held_s).abs() < 1e-6,
+            "re-emitted {time_s}s, not the held {held_s}s",
+        );
     }
 
     /// Two short forward scrubs each land on the exact target frame. These stay

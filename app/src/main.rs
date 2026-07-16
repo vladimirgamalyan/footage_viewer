@@ -31,9 +31,14 @@ const GRID_COLS_DEFAULT: usize = 4;
 const GRID_COLS_MIN: usize = 1;
 const GRID_COLS_MAX: usize = 12;
 
-/// Long side of decoded playback frames. Caps per-frame scaling and texture
-/// upload cost; large enough for the video to fill a typical window crisply.
-const PLAYBACK_LONG: u32 = 1600;
+/// Long side of decoded playback frames until the view has been laid out once and
+/// can ask for the size it actually shows (see [`decode_long_side`]).
+///
+/// Only ever a starting guess — the first repaint after a frame arrives replaces
+/// it with the real figure. Sized for a typical window so that first correction
+/// rescales frames that were already close, rather than visibly sharpening a clip
+/// that opened too soft.
+const PLAYBACK_LONG_START: u32 = 1600;
 
 /// Total thumbnails the recently-viewed grids may hold before the oldest is
 /// evicted. Stepping back to a clip just visited then costs nothing instead of
@@ -84,18 +89,6 @@ const SEEK_REPEAT_DELAY_S: f64 = 0.35;
 
 /// Interval between repeated A/D seeks while the key is held, in seconds.
 const SEEK_REPEAT_INTERVAL_S: f64 = 0.12;
-
-/// How far playback may be zoomed in, as a multiple of the fit-to-window scale.
-///
-/// Frames arrive capped at [`PLAYBACK_LONG`], so past roughly 2x on a filled
-/// window this magnifies the decoded frame rather than uncovering anything: on
-/// the 4K footage this tool targets the source's detail was resampled away
-/// before the zoom could ever reach it. So this bounds how far a useful
-/// magnifier goes, and is not the point where the picture stops being sharp —
-/// it stopped before here. Raising [`PLAYBACK_LONG`] is what would buy real
-/// detail, at a scaling and upload cost paid on every frame of every clip
-/// whether it is zoomed or not.
-const ZOOM_MAX: f32 = 8.0;
 
 /// What one press of `+`/`-` multiplies (or divides) the playback zoom by.
 const ZOOM_KEY_STEP: f32 = 1.25;
@@ -462,7 +455,14 @@ struct Player {
     /// when the file itself must be free; `None` only while being torn down.
     decoder: Option<thread::JoinHandle<()>>,
     tex: Option<egui::TextureHandle>,
-    frame_size: egui::Vec2,
+    /// The source's own size in its own pixels, from the last frame that arrived.
+    /// The texture's size is deliberately not kept: it tracks the zoom rather than
+    /// the clip (see [`decode_long_side`]), so it describes what the decoder was
+    /// last asked for, not what is being looked at. Zero until the first frame.
+    src_size: egui::Vec2,
+    /// Box the decoder was last asked to scale into, so the ask is only re-sent
+    /// when it actually changes rather than on every repaint.
+    long_side: u32,
     /// Media time of the last shown frame, for the scrubber handle.
     position_s: f64,
     /// UI-side pause tracking, toggled by Space.
@@ -473,8 +473,12 @@ struct Player {
 }
 
 /// How the played frame is placed in the video area: `zoom` as a multiple of the
-/// fit-to-window scale (1.0 being the whole frame letterboxed), and `offset`
-/// shifting it from centered, in screen points.
+/// [`base_scale`] (1.0 being the whole frame letterboxed), and `offset` shifting
+/// it from centered, in screen points.
+///
+/// Everything here is measured against the *source's* size, never the decoded
+/// frame's: the decoder rescales to follow this view (see [`decode_long_side`]),
+/// so laying the view out from what it produced would be circular.
 ///
 /// Kept on [`App`] rather than [`Player`] so it survives a trip back to the grid
 /// and a replay of the same clip — the frame being studied is usually the reason
@@ -495,8 +499,24 @@ impl Default for View {
 }
 
 impl View {
-    /// Where the frame lands inside `container`: the fit rect scaled by `zoom`
-    /// about the container's center, shifted by `offset`.
+    /// The most this view may be zoomed: the scale at which one source pixel
+    /// covers one physical display pixel, expressed as a multiple of
+    /// [`base_scale`].
+    ///
+    /// This is where zoom stops because it is where the source runs out — past it
+    /// the picture can only get bigger, never more detailed. It replaces a fixed
+    /// ceiling: how far the source's own pixels reach is a fact about the clip and
+    /// the window, not a number to pick. On 4K in a 1600-point window it lands near
+    /// 2.4x; on footage smaller than the window [`base_scale`] is already the cap
+    /// and this pins to 1.0, which is the floor too — such a clip simply doesn't
+    /// zoom.
+    fn max_zoom(container: egui::Rect, src: egui::Vec2, pixels_per_point: f32) -> f32 {
+        (native_scale(pixels_per_point) / base_scale(container, src, pixels_per_point)).max(1.0)
+    }
+
+    /// Where the frame lands inside `container`, given the source's size in its own
+    /// pixels: the base rect scaled by `zoom` about the container's center, shifted
+    /// by `offset`.
     ///
     /// Clamps `offset` on the way, which is what stops a drag from throwing the
     /// frame off into the black: an axis the zoomed frame overflows may be panned
@@ -505,11 +525,18 @@ impl View {
     /// also means zoom 1.0 pins the offset to zero and no separate "is it zoomed"
     /// test is needed anywhere.
     ///
+    /// Clamps `zoom` for the same reason and in the same place: the ceiling moves
+    /// with the window and the clip, so a frame zoomed to its source's limit and
+    /// then given a bigger window would otherwise stay magnified past it.
+    ///
     /// Clamping here rather than where the drag is read is what makes that true
     /// for every path into the offset — a drag, a zoom out from a panned-away
     /// corner, or the window being resized under a still frame.
-    fn place(&mut self, container: egui::Rect, frame_size: egui::Vec2) -> egui::Rect {
-        let size = fit_centered(container, frame_size).size() * self.zoom;
+    fn place(&mut self, container: egui::Rect, src: egui::Vec2, pixels_per_point: f32) -> egui::Rect {
+        self.zoom = self
+            .zoom
+            .clamp(1.0, Self::max_zoom(container, src, pixels_per_point));
+        let size = src * base_scale(container, src, pixels_per_point) * self.zoom;
         let slack = ((size - container.size()) * 0.5).max(egui::Vec2::ZERO);
         self.offset = self.offset.clamp(-slack, slack);
         egui::Rect::from_center_size(container.center() + self.offset, size)
@@ -520,9 +547,16 @@ impl View {
     /// Anchoring is what makes the wheel land on the thing being looked at rather
     /// than the middle of the window; `+`/`-` pass the center and get plain zoom
     /// about it.
-    fn zoom_by(&mut self, factor: f32, anchor: egui::Pos2, container: egui::Rect) {
+    fn zoom_by(
+        &mut self,
+        factor: f32,
+        anchor: egui::Pos2,
+        container: egui::Rect,
+        src: egui::Vec2,
+        pixels_per_point: f32,
+    ) {
         let before = self.zoom;
-        self.zoom = (self.zoom * factor).clamp(1.0, ZOOM_MAX);
+        self.zoom = (self.zoom * factor).clamp(1.0, Self::max_zoom(container, src, pixels_per_point));
         // Read back rather than reusing `factor`: at either end of the clamp the
         // zoom didn't move the whole way (or at all), and scaling the offset by
         // what was asked for would drift the frame under a wheel that is doing
@@ -815,7 +849,7 @@ impl App {
         let (cmd_tx, cmd_rx) = mpsc::channel::<media::PlayCommand>();
         let ctx_frame = ctx.clone();
         let decoder = thread::spawn(move || {
-            let result = media::play_stream(&path, start_from_s, PLAYBACK_LONG, cmd_rx, |f| {
+            let result = media::play_stream(&path, start_from_s, PLAYBACK_LONG_START, cmd_rx, |f| {
                 let delivered = frame_tx.send(PlayMsg::Frame(f)).is_ok();
                 ctx_frame.request_repaint();
                 delivered
@@ -832,7 +866,8 @@ impl App {
             rx: frame_rx,
             decoder: Some(decoder),
             tex: None,
-            frame_size: egui::Vec2::ZERO,
+            src_size: egui::Vec2::ZERO,
+            long_side: PLAYBACK_LONG_START,
             position_s: start_from_s,
             paused: false,
             scrub: None,
@@ -873,7 +908,7 @@ impl App {
             // A frame arriving means any scrub we fired has landed: the decoder
             // emits exactly one frame per `Scrub` and then holds on it.
             self.scrub_in_flight = false;
-            p.frame_size = egui::vec2(f.width as f32, f.height as f32);
+            p.src_size = egui::vec2(f.src_w as f32, f.src_h as f32);
             p.position_s = f.time_s;
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [f.width as usize, f.height as usize],
@@ -1580,6 +1615,17 @@ impl App {
             ctx.request_repaint();
         }
 
+        // Physical pixels per point, which is what "1:1 with the source" is
+        // measured against — see [`native_scale`].
+        let ppp = ctx.pixels_per_point();
+        // The view is laid out from the source's size, so the zoom needs it to know
+        // where the source's pixels run out. Zero until the first frame arrives,
+        // which pins the zoom until there is something to zoom.
+        let src_size = self
+            .player
+            .as_ref()
+            .map_or(egui::Vec2::ZERO, |p| p.src_size);
+
         // Full-window black backdrop: the frame is letterboxed above a scrubber
         // strip. Dragging the video area pans it and the wheel zooms it; the
         // scrubber handles its own clicks and drags.
@@ -1609,11 +1655,17 @@ impl App {
                     self.view = View::default();
                 }
                 if zoom_in {
-                    self.view.zoom_by(ZOOM_KEY_STEP, video_rect.center(), video_rect);
+                    self.view
+                        .zoom_by(ZOOM_KEY_STEP, video_rect.center(), video_rect, src_size, ppp);
                 }
                 if zoom_out {
-                    self.view
-                        .zoom_by(1.0 / ZOOM_KEY_STEP, video_rect.center(), video_rect);
+                    self.view.zoom_by(
+                        1.0 / ZOOM_KEY_STEP,
+                        video_rect.center(),
+                        video_rect,
+                        src_size,
+                        ppp,
+                    );
                 }
 
                 // The wheel zooms about the cursor. Exponential so each notch is
@@ -1624,8 +1676,13 @@ impl App {
                 let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                 if resp.hovered() && scroll != 0.0 {
                     if let Some(at) = ctx.input(|i| i.pointer.latest_pos()) {
-                        self.view
-                            .zoom_by((scroll * ZOOM_WHEEL_SPEED).exp(), at, video_rect);
+                        self.view.zoom_by(
+                            (scroll * ZOOM_WHEEL_SPEED).exp(),
+                            at,
+                            video_rect,
+                            src_size,
+                            ppp,
+                        );
                     }
                 }
 
@@ -1639,15 +1696,29 @@ impl App {
                 let shown = self
                     .player
                     .as_ref()
-                    .and_then(|p| p.tex.as_ref().map(|t| (t.id(), p.frame_size)));
-                if let Some((tex, frame_size)) = shown {
-                    let target = self.view.place(video_rect, frame_size);
+                    .and_then(|p| p.tex.as_ref().map(|t| (t.id(), p.src_size)));
+                if let Some((tex, src_size)) = shown {
+                    let target = self.view.place(video_rect, src_size, ppp);
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     // Clipped: a zoomed frame is larger than the area it plays in
                     // and would otherwise paint straight over the scrubber.
                     ui.painter()
                         .with_clip_rect(video_rect)
                         .image(tex, target, uv, egui::Color32::WHITE);
+
+                    // Have the decoder produce what this rect shows. Derived from
+                    // the rect actually painted, so what arrives can never disagree
+                    // with what it was scaled for. The frame on screen is the old
+                    // scale until the next one lands — a zoom therefore sharpens a
+                    // beat late rather than immediately, which is the cost of
+                    // scaling in the decoder instead of shipping every clip at 4K.
+                    let want = decode_long_side(target, src_size, ppp);
+                    if let Some(p) = &mut self.player {
+                        if p.long_side != want {
+                            p.long_side = want;
+                            let _ = p.cmds.send(media::PlayCommand::SetLongSide(want));
+                        }
+                    }
                 }
 
                 let mut cmd = None;
@@ -1828,6 +1899,57 @@ fn fit_centered(container: egui::Rect, size: egui::Vec2) -> egui::Rect {
     }
     let scale = (container.width() / size.x).min(container.height() / size.y);
     egui::Rect::from_center_size(container.center(), size * scale)
+}
+
+/// Screen points per source pixel at which one source pixel covers exactly one
+/// physical display pixel.
+///
+/// Physical rather than logical: a point is whatever the display scaling makes it,
+/// so holding 1:1 against points would still magnify the frame on any screen not
+/// set to 100%. The pixel the user is promised is the one on their monitor.
+fn native_scale(pixels_per_point: f32) -> f32 {
+    1.0 / pixels_per_point
+}
+
+/// Screen points per source pixel at zoom 1.0: the whole frame letterboxed, but
+/// never magnified past its own pixels.
+///
+/// The [`native_scale`] cap only binds on footage smaller than the window, where
+/// fitting would mean blowing the clip up — the 4K material this tool targets is
+/// always the other way round and simply gets the fit. Capping here rather than in
+/// the zoom alone is what makes "never magnified past the source" true of the view
+/// as a whole, including the one it opens at.
+fn base_scale(container: egui::Rect, src: egui::Vec2, pixels_per_point: f32) -> f32 {
+    if src.x <= 0.0 || src.y <= 0.0 {
+        return 1.0;
+    }
+    let fit = fit_centered(container, src).width() / src.x;
+    fit.min(native_scale(pixels_per_point))
+}
+
+/// The long side, in source pixels, of the box the decoder should scale frames
+/// into to fill `target` — one texel per physical display pixel, capped at the
+/// source's own long side.
+///
+/// This is the whole reason a zoom can reach real detail. Frames are scaled once,
+/// in the decoder, so whatever is asked for here is the ceiling on what any zoom
+/// can show: a fixed box (as this used to have) means a zoom magnifies an image
+/// already resampled down, and no amount of zooming brings back what that
+/// resample threw away.
+///
+/// Asking for exactly what is on screen is also what keeps that affordable. A clip
+/// merely being watched costs what it always did — at fit the box *is* the window
+/// — and only zooming walks it up towards the source, on the frames of the one
+/// clip being studied. Decoding every clip at 4K to serve the zooms that never
+/// happen would cost ~5.75x the pixels per frame, forever, for a picture identical
+/// at fit: the window cannot show more than the window has.
+///
+/// The cap matters as much as the ask: past the source, swscale would upscale, and
+/// invented pixels cost real bandwidth to carry.
+fn decode_long_side(target: egui::Rect, src: egui::Vec2, pixels_per_point: f32) -> u32 {
+    let shown_px = target.width().max(target.height()) * pixels_per_point;
+    let src_long = src.x.max(src.y).max(2.0) as u32;
+    (shown_px.round().max(2.0) as u32).min(src_long)
 }
 
 impl eframe::App for App {
@@ -2222,7 +2344,8 @@ mod tests {
             rx,
             decoder: None,
             tex: None,
-            frame_size: egui::Vec2::ZERO,
+            src_size: egui::Vec2::ZERO,
+            long_side: PLAYBACK_LONG_START,
             position_s: 0.0,
             paused: false,
             scrub: None,
@@ -2251,7 +2374,8 @@ mod tests {
                 rx,
                 decoder: Some(decoder),
                 tex: None,
-                frame_size: egui::Vec2::ZERO,
+                src_size: egui::Vec2::ZERO,
+                long_side: PLAYBACK_LONG_START,
                 position_s: 0.0,
                 paused: false,
                 scrub: None,
@@ -2598,12 +2722,17 @@ mod tests {
         assert_eq!(alpha, Some(1.0), "the plate should be solid again, not still fading");
     }
 
-    /// A 400x200 view showing a 2:1 frame, so the fit rect is the whole view and
-    /// the arithmetic below stays readable.
+    /// A 400x200 view showing a 2:1 clip, so the fit rect is the whole view and
+    /// the arithmetic below stays readable. [`SRC`] is 5x the view across, which
+    /// puts the zoom cap at exactly 5.0 and keeps the numbers exact.
     fn view_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0))
     }
-    const FRAME: egui::Vec2 = egui::vec2(2000.0, 1000.0);
+    /// The *source's* size in its own pixels — what the view lays out from, and
+    /// deliberately not the size of any decoded frame, which follows the zoom.
+    const SRC: egui::Vec2 = egui::vec2(2000.0, 1000.0);
+    /// A display at 100%, where one point is one physical pixel.
+    const PPP: f32 = 1.0;
 
     /// Unzoomed playback is exactly the letterboxed fit it was before zoom
     /// existed, and no drag can shift it: there is nothing off screen to pan to.
@@ -2612,9 +2741,9 @@ mod tests {
         // As if dragged.
         let mut view = View { offset: egui::vec2(50.0, 50.0), ..Default::default() };
 
-        let target = view.place(view_rect(), FRAME);
+        let target = view.place(view_rect(), SRC, PPP);
 
-        assert_eq!(target, fit_centered(view_rect(), FRAME), "fit, ignoring the drag");
+        assert_eq!(target, fit_centered(view_rect(), SRC), "fit, ignoring the drag");
         assert_eq!(view.offset, egui::Vec2::ZERO, "the drag should have been clamped away");
     }
 
@@ -2625,7 +2754,7 @@ mod tests {
     fn panning_stops_at_the_edge_of_the_zoomed_frame() {
         let mut view = View { zoom: 2.0, offset: egui::vec2(5000.0, -5000.0) };
 
-        let target = view.place(view_rect(), FRAME);
+        let target = view.place(view_rect(), SRC, PPP);
 
         assert_eq!(view.offset, egui::vec2(200.0, -100.0), "clamped to the frame's edges");
         assert_eq!(target.min.x, 0.0, "the frame's left edge should sit on the view's");
@@ -2639,12 +2768,12 @@ mod tests {
         let rect = view_rect();
         let at = egui::pos2(100.0, 50.0); // off-center, so an unanchored zoom would move it
         let mut view = View::default();
-        let before = view.place(rect, FRAME);
+        let before = view.place(rect, SRC, PPP);
         // Where the cursor sits within the frame, as a fraction of it.
         let frac = (at - before.min) / before.size();
 
-        view.zoom_by(2.0, at, rect);
-        let after = view.place(rect, FRAME);
+        view.zoom_by(2.0, at, rect, SRC, PPP);
+        let after = view.place(rect, SRC, PPP);
 
         let moved_to = after.min + (frac * after.size());
         assert!(
@@ -2662,26 +2791,81 @@ mod tests {
 
         // Far more zoom-out than it takes to get back to 1.0.
         for _ in 0..20 {
-            view.zoom_by(1.0 / ZOOM_KEY_STEP, egui::pos2(0.0, 0.0), rect);
+            view.zoom_by(1.0 / ZOOM_KEY_STEP, egui::pos2(0.0, 0.0), rect, SRC, PPP);
         }
-        let target = view.place(rect, FRAME);
+        let target = view.place(rect, SRC, PPP);
 
         assert_eq!(view.zoom, 1.0, "zoom should have stopped at the whole frame");
-        assert_eq!(target, fit_centered(rect, FRAME), "and left it centered");
+        assert_eq!(target, fit_centered(rect, SRC), "and left it centered");
     }
 
-    /// Zoom in stops at [`ZOOM_MAX`] rather than running away into a texture that
-    /// has no more detail to give.
+    /// Zoom in stops where the source's own pixels run out, rather than at a fixed
+    /// ceiling: at the cap one source pixel covers exactly one display pixel, and
+    /// a step further could only magnify pixels, never uncover them.
     #[test]
-    fn zooming_in_stops_at_the_cap() {
+    fn zooming_in_stops_at_one_source_pixel_per_display_pixel() {
         let rect = view_rect();
         let mut view = View::default();
 
         for _ in 0..100 {
-            view.zoom_by(ZOOM_KEY_STEP, rect.center(), rect);
+            view.zoom_by(ZOOM_KEY_STEP, rect.center(), rect, SRC, PPP);
         }
+        let target = view.place(rect, SRC, PPP);
 
-        assert_eq!(view.zoom, ZOOM_MAX);
+        assert_eq!(view.zoom, 5.0, "400 points of view across 2000 source pixels");
+        assert_eq!(
+            target.size() * PPP,
+            SRC,
+            "the frame should cover exactly as many display pixels as the source has",
+        );
+    }
+
+    /// "1:1" is measured against the display's pixels, not egui's points: on a
+    /// screen at 200% the same source runs out of pixels after half as many points,
+    /// so the cap has to come down to match or the frame is magnified anyway.
+    #[test]
+    fn the_zoom_cap_follows_the_displays_scaling() {
+        let rect = view_rect();
+        // Far past any cap, so `place` has to clamp it back to one.
+        let mut view = View { zoom: 100.0, offset: egui::Vec2::ZERO };
+
+        let target = view.place(rect, SRC, 2.0);
+
+        assert_eq!(view.zoom, 2.5, "half the zoom a 100% display allows");
+        assert_eq!(target.size() * 2.0, SRC, "still one source pixel per display pixel");
+    }
+
+    /// A clip smaller than the window is shown at its own size rather than blown up
+    /// to fill it, and offers no zoom at all: fitting it would already be
+    /// magnifying, so its own pixels are the ceiling and the floor at once.
+    #[test]
+    fn a_clip_smaller_than_the_window_is_not_magnified() {
+        let rect = view_rect(); // 400x200 points
+        let src = egui::vec2(100.0, 50.0);
+        let mut view = View { zoom: 100.0, offset: egui::vec2(50.0, 50.0) };
+
+        let target = view.place(rect, src, PPP);
+
+        assert_eq!(view.zoom, 1.0, "there is nothing to zoom into");
+        assert_eq!(target.size(), src, "shown at its own size...");
+        assert_eq!(target.center(), rect.center(), "...centered in the black");
+    }
+
+    /// The decoder is asked for the window at fit and for the whole source at the
+    /// zoom cap. That gap is the point of the whole arrangement: the zoom reaches
+    /// detail the fit never carried, and a clip that is merely watched never pays
+    /// to decode pixels its window cannot show.
+    #[test]
+    fn the_decode_box_tracks_what_the_view_shows() {
+        let rect = view_rect();
+        let mut view = View::default();
+
+        let fit = view.place(rect, SRC, PPP);
+        assert_eq!(decode_long_side(fit, SRC, PPP), 400, "at fit, the window's own width");
+
+        view.zoom = View::max_zoom(rect, SRC, PPP);
+        let zoomed = view.place(rect, SRC, PPP);
+        assert_eq!(decode_long_side(zoomed, SRC, PPP), 2000, "at the cap, the source itself");
     }
 
     #[test]
