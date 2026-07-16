@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
-use image::ImageEncoder;
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
@@ -1376,8 +1376,12 @@ pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> any
     let encode_start = Instant::now();
     let file = std::fs::File::create(out)?;
     let writer = std::io::BufWriter::new(file);
-    image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality)
-        .write_image(&buf, w, h, image::ExtendedColorType::Rgb8)?;
+    let mut encoder = Encoder::new(writer, quality);
+    // Pinned rather than left to `quality`, which this encoder reads as 4:2:0
+    // below 90: a still is kept for its detail, and the one it would lose is the
+    // chroma a grade later leans on.
+    encoder.set_sampling_factor(SamplingFactor::F_1_1);
+    encoder.encode(&buf, u16::try_from(w)?, u16::try_from(h)?, ColorType::Rgb)?;
     let encode_ms = millis(encode_start.elapsed());
 
     log::info!(

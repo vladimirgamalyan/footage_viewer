@@ -15,9 +15,15 @@ ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", 
 anyhow = "1"
 # Logging facade; routes through the app's file logger. Used for scrub timing.
 log = "0.4"
-# JPEG-only: encodes single full-resolution stills (save_frame_jpeg).
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Encodes single full-resolution stills (save_frame_jpeg), in place of image's
+# encoder: that one spends ~440 ms on a 4K still on the tester's machine, which
+# is half of what the "📷" makes her wait (see docs/adr/0008). Same 4:4:4 q92
+# output for ~1.7x the speed on the 4K fixture here. `simd` is off by default and
+# dispatches on AVX2 at runtime; it is the smaller half of that gain, so a
+# machine without AVX2 still comes out ahead.
+jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 
 [dev-dependencies]
-# For the dump_grid example, which eyeballs extract_grid output as PNGs.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Reads back what the tests and the dump_grid example write: JPEG for the still
+# save_frame_jpeg produces, PNG for the grid the example eyeballs.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
