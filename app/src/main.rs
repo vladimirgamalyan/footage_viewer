@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use eframe::egui;
 use footage_viewer_media as media;
@@ -438,6 +439,12 @@ struct Saving {
     /// The time in the clip being saved, kept for the log a failure writes —
     /// which frame was asked for is what makes one reproducible.
     time_s: f64,
+    /// When the write was started, for the log the outcome writes. `save_frame_jpeg`
+    /// times its own stages, but only this side can see what the user waited: the
+    /// confirmation is raised from the outcome, so this spans the write *plus* the
+    /// repaint that delivers it. A gap between the two is the UI being slow to
+    /// collect a still that was ready.
+    started: Instant,
     /// `Ok` once the still is written, else why it failed.
     rx: Receiver<Result<(), String>>,
 }
@@ -1261,6 +1268,9 @@ impl App {
         let Some(l) = &self.loaded else { return };
         let request = (l.path.clone(), time_s);
         if self.saving.is_some() {
+            // The wait this press turns into is its own write plus all of the one
+            // already running, which no single timing below shows.
+            log::info!("still at {time_s:.3}s held behind one being written");
             self.pending_save = Some(request);
             return;
         }
@@ -1280,16 +1290,22 @@ impl App {
             // repaints while the app sits on a finished grid.
             ctx_end.request_repaint();
         });
-        self.saving = Some(Saving { out, time_s, rx });
+        self.saving = Some(Saving {
+            out,
+            time_s,
+            started: Instant::now(),
+            rx,
+        });
     }
 
     /// Take the outcome of a save that has landed: confirm it, or record why it
     /// failed. Then start whatever request was held behind it.
     fn settle_save(&mut self, ctx: &egui::Context, s: Saving, result: Result<(), String>) {
         let out = s.out;
+        let waited_ms = s.started.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(()) => {
-                log::info!("saved still {}", out.display());
+                log::info!("saved still {} | 📷 shown after {waited_ms:.0}ms", out.display());
                 // Names the still rather than the clip: the file is written next
                 // to the clip and never shown, so where it went is the one thing
                 // the confirmation can usefully say.
@@ -2331,6 +2347,7 @@ mod tests {
             Saving {
                 out: PathBuf::from("clip.jpg"),
                 time_s: 0.0,
+                started: Instant::now(),
                 rx,
             },
             closed,

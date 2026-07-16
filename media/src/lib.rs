@@ -1060,9 +1060,18 @@ pub fn play_stream(
 /// before the target and decodes forward to the first frame at/after it — the
 /// same precise landing a scrub uses — so the saved still matches what playback
 /// shows at that time. Overwrites `out` if it already exists.
+///
+/// Reports its timing breakdown on the way out (see `docs/adr/0008`). The app
+/// only confirms the save once this returns, so however long this takes is how
+/// long the "📷" takes to appear, and the split is the only way to tell which of
+/// the five stages a tester's wait was spent in. Unlike playback (ADR-0009) this
+/// attaches no hardware device, so the decode is always on the CPU.
 pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> anyhow::Result<()> {
+    let total_start = Instant::now();
     let mut ictx = input(path)?;
+    let open_ms = millis(total_start.elapsed());
 
+    let setup_start = Instant::now();
     let stream = ictx
         .streams()
         .best(Type::Video)
@@ -1084,12 +1093,17 @@ pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> any
 
     // Full source resolution, RGB (no alpha) — JPEG has no alpha channel.
     let mut scaler = Scaler::get(decoder.format(), w, h, Pixel::RGB24, w, h, Flags::BILINEAR)?;
+    let setup_ms = millis(setup_start.elapsed());
 
     // Land on the keyframe at or before the target, then decode forward to it.
+    let seek_start = Instant::now();
     let target_us = (((time_s + start_s) * AV_TIME_BASE) as i64 - SEEK_BACK_US).max(0);
     ictx.seek(target_us, ..target_us)?;
     decoder.flush();
+    let seek_ms = millis(seek_start.elapsed());
 
+    let decode_start = Instant::now();
+    let mut decoded = 0u32;
     let mut demux_eof = false;
     let mut eof_sent = false;
     // Keep the newest decoded frame so end-of-stream (target past the last frame)
@@ -1098,6 +1112,7 @@ pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> any
     loop {
         match next_frame(&mut ictx, &mut decoder, stream_index, &mut demux_eof, &mut eof_sent)? {
             Some(frame) => {
+                decoded += 1;
                 let t = (frame_pts(&frame) as f64 * tb_secs - start_s).max(0.0);
                 let reached = t + FRAME_EPS_S >= time_s;
                 chosen = Some(frame);
@@ -1108,8 +1123,10 @@ pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> any
             None => break,
         }
     }
+    let decode_ms = millis(decode_start.elapsed());
     let frame = chosen.ok_or_else(|| anyhow::anyhow!("no frame decoded at {time_s:.3}s"))?;
 
+    let convert_start = Instant::now();
     let mut rgb = Video::empty();
     scaler.run(&frame, &mut rgb)?;
 
@@ -1122,11 +1139,27 @@ pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> any
         let start = y * stride;
         buf.extend_from_slice(&data[start..start + row]);
     }
+    let convert_ms = millis(convert_start.elapsed());
 
+    let encode_start = Instant::now();
     let file = std::fs::File::create(out)?;
     let writer = std::io::BufWriter::new(file);
     image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality)
         .write_image(&buf, w, h, image::ExtendedColorType::Rgb8)?;
+    let encode_ms = millis(encode_start.elapsed());
+
+    log::info!(
+        "still -> {time_s:.3}s | total {:.0}ms | open {open_ms:.0}ms | setup {setup_ms:.0}ms | \
+         seek {seek_ms:.0}ms | decoded {decoded} frames {decode_ms:.0}ms ({:.1}ms/f) | \
+         convert {convert_ms:.0}ms | encode {encode_ms:.0}ms | {w}x{h} ({:.1} MP), q{quality}",
+        millis(total_start.elapsed()),
+        if decoded > 0 {
+            decode_ms / decoded as f64
+        } else {
+            0.0
+        },
+        (w as f64 * h as f64) / 1e6,
+    );
     Ok(())
 }
 
