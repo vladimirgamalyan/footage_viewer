@@ -494,6 +494,12 @@ impl Drop for PaceReport {
 struct GridProfile {
     start: Instant,
     open_ms: f64,
+    /// The two halves of [`Self::open_ms`]: reading the container header, then
+    /// probing the streams. Split because opening costs the tester ~600 ms
+    /// whichever disk the clip is on, and no local measurement can say which
+    /// half that is — see [`open_timed`] and ADR-0017.
+    header_ms: f64,
+    probe_ms: f64,
     setup_ms: f64,
     demux_ms: f64,
     decode_ms: f64,
@@ -550,11 +556,14 @@ impl Spread {
 
 impl GridProfile {
     /// Open a profile for a pass that began at `start`, with the file already
-    /// opened and probed (so that cost is known).
-    fn new(start: Instant) -> Self {
+    /// opened and probed (so that cost is known). `header_ms` and `probe_ms` are
+    /// the two halves of that cost — see [`open_timed`].
+    fn new(start: Instant, header_ms: f64, probe_ms: f64) -> Self {
         Self {
             start,
             open_ms: millis(start.elapsed()),
+            header_ms,
+            probe_ms,
             setup_ms: 0.0,
             demux_ms: 0.0,
             decode_ms: 0.0,
@@ -584,13 +593,15 @@ impl GridProfile {
         let mb = self.bytes as f64 / 1e6;
         let read_mb_s = self.read_mb_s();
         log::info!(
-            "grid {}: kept {kept}/{} keyframes | total {:.0}ms | open {:.0}ms | setup {:.0}ms | \
-             demux {:.0}ms ({mb:.1} MB, {read_mb_s:.0} MB/s) | decode {:.0}ms | convert {:.0}ms | \
-             keyframes {:.1} MB ({:.0}% of stream)",
+            "grid {}: kept {kept}/{} keyframes | total {:.0}ms | open {:.0}ms (header {:.0}ms + \
+             probe {:.0}ms) | setup {:.0}ms | demux {:.0}ms ({mb:.1} MB, {read_mb_s:.0} MB/s) | \
+             decode {:.0}ms | convert {:.0}ms | keyframes {:.1} MB ({:.0}% of stream)",
             if cancelled { "cancelled" } else { "done" },
             self.keyframes,
             millis(self.start.elapsed()),
             self.open_ms,
+            self.header_ms,
+            self.probe_ms,
             self.setup_ms,
             self.demux_ms,
             self.decode_ms,
@@ -767,8 +778,8 @@ pub fn extract_grid_streaming(
     mut on_thumb: impl FnMut(usize, Thumbnail),
 ) -> anyhow::Result<Option<ClipStats>> {
     let t0 = Instant::now();
-    let mut ictx = input(path)?;
-    let mut profile = GridProfile::new(t0);
+    let (mut ictx, header_ms, probe_ms) = open_timed(path)?;
+    let mut profile = GridProfile::new(t0, header_ms, probe_ms);
 
     let stream = ictx
         .streams()
@@ -1502,7 +1513,7 @@ pub fn play_stream(
 /// attaches no hardware device, so the decode is always on the CPU.
 pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> anyhow::Result<()> {
     let total_start = Instant::now();
-    let mut ictx = input(path)?;
+    let (mut ictx, header_ms, probe_ms) = open_timed(path)?;
     let open_ms = millis(total_start.elapsed());
 
     let setup_start = Instant::now();
@@ -1587,9 +1598,10 @@ pub fn save_frame_jpeg(path: &Path, time_s: f64, out: &Path, quality: u8) -> any
     let encode_ms = millis(encode_start.elapsed());
 
     log::info!(
-        "still -> {time_s:.3}s | total {:.0}ms | open {open_ms:.0}ms | setup {setup_ms:.0}ms | \
-         seek {seek_ms:.0}ms | decoded {decoded} frames {decode_ms:.0}ms ({:.1}ms/f) | \
-         convert {convert_ms:.0}ms | encode {encode_ms:.0}ms | {w}x{h} ({:.1} MP), q{quality}",
+        "still -> {time_s:.3}s | total {:.0}ms | open {open_ms:.0}ms (header {header_ms:.0}ms + \
+         probe {probe_ms:.0}ms) | setup {setup_ms:.0}ms | seek {seek_ms:.0}ms | \
+         decoded {decoded} frames {decode_ms:.0}ms ({:.1}ms/f) | convert {convert_ms:.0}ms | \
+         encode {encode_ms:.0}ms | {w}x{h} ({:.1} MP), q{quality}",
         millis(total_start.elapsed()),
         if decoded > 0 {
             decode_ms / decoded as f64
@@ -1661,6 +1673,58 @@ fn next_frame(
 /// A `Duration` as fractional milliseconds, for timing logs.
 fn millis(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+/// `ffmpeg::format::input` with its two halves timed apart: reading the container
+/// header (`avformat_open_input`) and probing the streams
+/// (`avformat_find_stream_info`). Returns the context and the two costs in
+/// milliseconds.
+///
+/// See ADR-0017. Opening a clip costs the tester 332–1226 ms against 14 ms here,
+/// and — the fact that rules out the disk — it is the same on their 150 MB/s
+/// internal drive as on their 40 MB/s external one. Locally the split is 1 ms
+/// header against 13 ms probe, and capping `probesize`/`analyzeduration` moves
+/// neither, so no local measurement can say where their 600 ms sits. Reporting
+/// the halves lets their log say it, the way ADR-0010's `grid done` split let a
+/// log settle demux.
+///
+/// This mirrors what `input()` does, because `input()` runs both calls back to
+/// back and can only report their sum.
+fn open_timed(path: &Path) -> anyhow::Result<(ffmpeg::format::context::Input, f64, f64)> {
+    let cpath = path
+        .to_str()
+        .and_then(|s| std::ffi::CString::new(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))?;
+
+    unsafe {
+        let mut ps = std::ptr::null_mut();
+
+        let t = Instant::now();
+        let e = ffmpeg::sys::avformat_open_input(
+            &mut ps,
+            cpath.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if e != 0 {
+            return Err(ffmpeg::Error::from(e).into());
+        }
+        let header_ms = millis(t.elapsed());
+
+        let t = Instant::now();
+        let e = ffmpeg::sys::avformat_find_stream_info(ps, std::ptr::null_mut());
+        if e < 0 {
+            ffmpeg::sys::avformat_close_input(&mut ps);
+            return Err(ffmpeg::Error::from(e).into());
+        }
+        let probe_ms = millis(t.elapsed());
+
+        Ok((
+            ffmpeg::format::context::Input::wrap(ps),
+            header_ms,
+            probe_ms,
+        ))
+    }
 }
 
 /// Fit into a box whose long side is `long`, preserving aspect, even dimensions.
