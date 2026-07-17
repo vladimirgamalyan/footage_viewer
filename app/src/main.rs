@@ -241,18 +241,43 @@ fn is_taken(candidate: &Path, current: &Path) -> bool {
 /// Sibling video files sharing `current`'s directory, sorted by file name.
 /// Read fresh from disk on every call so files added while the app is running
 /// are picked up.
+///
+/// Reports what the scan cost (ADR-0018). The tester works a folder of ~2000
+/// clips on the external drive and reports that everything about it is slow;
+/// this runs on every navigation and was the one path with no measurement on it.
 fn sibling_videos(current: &Path) -> Vec<PathBuf> {
     let dir = match current.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let mut vids: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file() && is_video(p))
-        .collect();
+    let t0 = Instant::now();
+    let mut entries = 0usize;
+    let mut vids: Vec<PathBuf> = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        entries += 1;
+        let path = e.path();
+        if !is_video(&path) {
+            continue;
+        }
+        // `DirEntry::file_type` rather than `Path::is_file`: the latter is a
+        // fresh metadata call per entry — 2000 of them on the tester's folder,
+        // each its own round trip to a USB disk — while this is free on Windows,
+        // already read by the directory enumeration being walked. Measured on a
+        // warm 2000-file folder: 27 ms against 0.5 ms.
+        //
+        // "Not a directory" rather than "is a file" so a symlinked clip still
+        // counts, which is what `is_file` gave by following the link.
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            continue;
+        }
+        vids.push(path);
+    }
     vids.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    log::info!(
+        "folder scan: {} clips of {entries} entries in {:.0}ms",
+        vids.len(),
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
     vids
 }
 
