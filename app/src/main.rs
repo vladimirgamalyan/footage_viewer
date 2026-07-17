@@ -8,7 +8,7 @@
 // In release, build as a Windows GUI app so launching from Explorer doesn't flash a console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -19,6 +19,7 @@ use std::time::Instant;
 use eframe::egui;
 use footage_viewer_media as media;
 
+mod drive;
 mod logging;
 mod stats;
 
@@ -640,6 +641,10 @@ struct App {
     /// Whether the current clip has had its look-ahead decision made, so the
     /// folder is scanned once per clip rather than once per repaint.
     looked_ahead: bool,
+    /// Drive letters whose storage bus has already been logged this run, so the
+    /// line is written once per drive rather than once per clip. See
+    /// [`log_drive`](Self::log_drive) and ADR-0016.
+    drives_logged: HashSet<char>,
     /// Set while a live seek fired from the scrubber has not produced its frame
     /// yet, so a drag never has more than one seek in flight (see [`seek_bar_ui`]).
     scrub_in_flight: bool,
@@ -717,11 +722,30 @@ impl App {
         self.recent.remove(i)
     }
 
+    /// Name the storage bus behind `path`'s drive, once per drive per run.
+    ///
+    /// Every other line already carries the path, so one line per drive is
+    /// enough to attribute all of them; per clip it would be noise. See ADR-0016
+    /// for why the bus, and not the drive type, is the field that answers
+    /// "external or internal?".
+    fn log_drive(&mut self, path: &Path) {
+        let Some(letter) = drive::letter_of(path) else {
+            return;
+        };
+        if !self.drives_logged.insert(letter) {
+            return;
+        }
+        if let Some(bus) = drive::bus_of(letter) {
+            log::info!("storage: {letter}: is on a {bus} bus");
+        }
+    }
+
     /// Show `path`'s grid, without ever re-reading a clip we already have: from
     /// the recent cache, or from a prefetch already reading it, else by kicking
     /// off a fresh extraction. Returns immediately in every case.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         log::info!("opening clip: {}", path.display());
+        self.log_drive(&path);
         self.error = None;
         // Leaving any current clip: stop playback and fall back to the grid.
         self.player = None;

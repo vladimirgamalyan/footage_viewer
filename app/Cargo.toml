@@ -11,6 +11,20 @@ trash = "5.2.6"
 # eframe, declared here so the app can log directly. See src/logging.rs.
 log = "0.4"
 
+# Querying the storage bus behind a clip's drive, to tell an external disk from
+# an internal one in a tester's log. Already in the tree via eframe (same
+# version), so declaring it adds nothing to download and the offline local build
+# stays intact — the reasoning ADR-0008 used for `log`. See src/drive.rs.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+]
+
 [dev-dependencies]
 tempfile = "3"
 
