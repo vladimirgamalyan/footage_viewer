@@ -49,6 +49,14 @@ pub fn record(s: &media::ClipStats) {
 /// CSV so fields can be added later without stranding the records already
 /// collected.
 ///
+/// That tolerance is also what lets a field be *renamed* when what it measures
+/// changes, which is the only safe way to change one. `scan_ms`/`scan_mb_s` were
+/// `demux_ms`/`read_mb_s` until ADR-0015 made the grid seek to the keyframes
+/// instead of reading past them: the old names describe a sequential read of the
+/// whole file, the new ones a skip-scan of a third of it, and the two are not
+/// comparable. Records from before it keep the old names and the old meaning, so
+/// a reader gets two sparse columns rather than one dense misleading one.
+///
 /// Nothing here is escaped, because nothing here can need it: the text fields are
 /// either libav identifiers (`hevc`, `yuv420p10le`) or a Windows file name, and
 /// Windows forbids every character JSON would care about (`"`, `\`, controls) in
@@ -66,8 +74,8 @@ fn line(s: &media::ClipStats, ts: &str) -> String {
          \"gop_s\":{{\"min\":{gs_min:.3},\"mean\":{gs_mean:.3},\"max\":{gs_max:.3}}},\
          \"key_share_pct\":{key_share:.1},\"hw\":\"{hw}\",\
          \"grid_ms\":{grid_ms:.0},\"open_ms\":{open_ms:.0},\"setup_ms\":{setup_ms:.0},\
-         \"demux_ms\":{demux_ms:.0},\"decode_ms\":{decode_ms:.0},\"convert_ms\":{convert_ms:.0},\
-         \"read_mb_s\":{read_mb_s:.0}}}\n",
+         \"scan_ms\":{scan_ms:.0},\"decode_ms\":{decode_ms:.0},\"convert_ms\":{convert_ms:.0},\
+         \"scan_mb_s\":{scan_mb_s:.0}}}\n",
         file = s.file,
         size_mb = s.size_bytes as f64 / 1e6,
         container = s.container,
@@ -94,10 +102,10 @@ fn line(s: &media::ClipStats, ts: &str) -> String {
         grid_ms = s.grid_ms,
         open_ms = s.open_ms,
         setup_ms = s.setup_ms,
-        demux_ms = s.demux_ms,
+        scan_ms = s.scan_ms,
         decode_ms = s.decode_ms,
         convert_ms = s.convert_ms,
-        read_mb_s = s.read_mb_s,
+        scan_mb_s = s.scan_mb_s,
     )
 }
 
@@ -133,10 +141,10 @@ mod tests {
             grid_ms: 4820.0,
             open_ms: 31.0,
             setup_ms: 12.0,
-            demux_ms: 3110.0,
+            scan_ms: 3110.0,
             decode_ms: 1520.0,
             convert_ms: 160.0,
-            read_mb_s: 592.0,
+            scan_mb_s: 592.0,
         }
     }
 
@@ -152,7 +160,7 @@ mod tests {
         assert!(line.ends_with('\n'), "record must be one line: {line}");
         assert_eq!(line.matches('\n').count(), 1, "record spans lines: {line}");
         assert!(line.starts_with(r#"{"ts":"2026-07-16 10:22:31.123Z","file":"C0042.MP4""#));
-        assert!(line.trim_end().ends_with("\"read_mb_s\":592}"), "{line}");
+        assert!(line.trim_end().ends_with("\"scan_mb_s\":592}"), "{line}");
         // Braces balance, i.e. the nested objects opened and closed as intended.
         assert_eq!(line.matches('{').count(), line.matches('}').count(), "{line}");
     }
