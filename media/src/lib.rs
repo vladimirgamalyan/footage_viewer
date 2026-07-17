@@ -83,9 +83,38 @@ const LOG_SCRUB_TIMING: bool = true;
 /// cost on heavy footage. Frame-threading throughput saturates well before that
 /// many threads for H.264/HEVC, so capping low keeps real-time playback while
 /// cutting the warmup (measured ~18 buffered frames at 32 threads down to ~8 at
-/// 6). The grid path intentionally keeps all cores: it is a batch decode where
-/// startup latency does not matter.
+/// 6).
+///
+/// The grid has the same warmup and caps it separately — see [`GRID_GPU_THREADS`].
 const PLAYBACK_THREADS: usize = 6;
+
+/// Frame-decoding threads for the grid when it decodes on the GPU.
+///
+/// The grid used to keep all cores here, on the reasoning that it is a batch
+/// decode where startup latency does not matter. Both halves of that stopped
+/// being true. ADR-0010 measured the latency as user-visible — a blank grid for
+/// the whole read — and ADR-0009 moved big frames to the GPU, where the threads
+/// have nothing left to parallelize.
+///
+/// Measured on the 4K fixture, release, decoding its 17 keyframes (see ADR-0019):
+///
+/// | threads | on the GPU | on the CPU |
+/// |---|---|---|
+/// | all cores (16) | 50 ms, first frame after 18 packets | 55 ms, after 18 |
+/// | 1 | **25 ms, first frame after 3** | 222 ms, after 3 |
+/// | 2 | 15 ms, after 4 | 113 ms, after 4 |
+/// | 6 | 18 ms, after 8 | 49 ms, after 8 |
+///
+/// On the GPU all cores are the worst of both: slowest *and* nothing released
+/// until the file is read. On the CPU the threads still pay (222 ms against
+/// 49 ms), so this cap applies to the GPU path alone and the CPU path keeps
+/// `count: 0`.
+///
+/// One rather than two: the 10 ms two threads save is noise against a read
+/// measured in seconds, and a thread costs a whole keyframe of warmup — which on
+/// the target's external disk is a seek. Three packets is the floor either way,
+/// set by the stream's B-frame reorder delay, not by this.
+const GRID_GPU_THREADS: usize = 1;
 
 /// Frames larger than this decode faster on the GPU than on the CPU, so both the
 /// grid and playback ask for a D3D11VA decoder above it and stay on the CPU at or
@@ -816,22 +845,20 @@ pub fn extract_grid_streaming(
             Pixel::from((*c).pix_fmt),
         )
     };
-    // Decode across all cores. Frame-level threading is the biggest speedup for
-    // H.264/HEVC (count 0 auto-detects the logical CPU count); the few frames of
-    // pipeline latency it adds are drained after each packet and at end-of-stream.
-    // Sending only keyframes makes every frame independent, so this parallelizes
-    // near-perfectly — which is why the grid keeps all cores where playback caps
-    // them (see PLAYBACK_THREADS), and why the GPU has a much smaller edge here.
-    decoder_ctx.set_threading(ffmpeg::codec::threading::Config::kind(
-        ffmpeg::codec::threading::Type::Frame,
-    ));
     // Big frames decode faster on the GPU — see HW_MIN_PIXELS.
-    if src_w * src_h > HW_MIN_PIXELS {
-        if let Some(hw) = hw_device() {
-            // Safety: the context is not opened until below.
-            unsafe { hw.attach(decoder_ctx.as_mut_ptr()) };
-        }
+    let on_gpu = src_w * src_h > HW_MIN_PIXELS && hw_device().is_some();
+    if on_gpu {
+        // Safety: the context is not opened until below.
+        unsafe { hw_device().expect("checked just above").attach(decoder_ctx.as_mut_ptr()) };
     }
+    // Frame-level threading, but only where it earns its warmup. A frame thread
+    // costs one keyframe of latency before the decoder releases anything, so the
+    // count is also how long the grid stays blank (see GRID_GPU_THREADS and
+    // ADR-0019).
+    decoder_ctx.set_threading(ffmpeg::codec::threading::Config {
+        kind: ffmpeg::codec::threading::Type::Frame,
+        count: if on_gpu { GRID_GPU_THREADS } else { 0 },
+    });
     let mut decoder = decoder_ctx.decoder().video()?;
     // Opening the decoder also opens the shared GPU device on the first clip of a
     // session (~100 ms), so this is reported apart from the decode itself.
@@ -2190,16 +2217,61 @@ mod tests {
         assert!(stats.is_none(), "a cancelled pass reported stats");
     }
 
+    /// The grid hands thumbnails over while it is still reading, instead of
+    /// holding every one until the file is done. This is what ADR-0019 caps the
+    /// GPU path's frame threads for, and on the target's external disk it is the
+    /// difference between a grid that fills and a blank one that waits out a
+    /// multi-second read.
+    ///
+    /// Cancelling on the first thumbnail is what makes it observable: a pass that
+    /// streams sees the flag mid-read and keeps fewer keyframes than a full grid.
+    /// With all cores — the setting before ADR-0019 — the 4K fixture released
+    /// nothing until `send_eof`, so the flag arrived after the last packet and
+    /// every keyframe was kept.
+    #[test]
+    fn the_4k_grid_streams_thumbnails_before_it_finishes() {
+        init().unwrap();
+        // The cap is the GPU path's; on a machine without one the grid keeps all
+        // cores and the warmup that comes with them, by decision, not by defect.
+        if hw_device().is_none() {
+            return;
+        }
+        let path = test_video("camera_8s_4k.mp4");
+        let full = extract_grid(&path, 1.0, 320).unwrap().thumbs.len();
+        assert!(full > 2, "fixture should fill a grid, kept {full}");
+
+        let cancel = AtomicBool::new(false);
+        let mut kept = 0usize;
+        extract_grid_streaming(
+            &path,
+            1.0,
+            320,
+            &cancel,
+            |_| {},
+            |_, _| {
+                kept += 1;
+                cancel.store(true, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+
+        assert!(
+            kept < full,
+            "grid held every thumbnail until the read finished: kept {kept} of {full}"
+        );
+    }
+
     /// Setting the cancel flag mid-pass stops it early instead of reading the file
     /// to the end. This is the whole point of the flag: on the external HDD the
     /// target archive lives on, a pass nobody is listening to keeps the disk head
     /// busy for seconds, so it must stop reading as soon as it is abandoned.
     ///
-    /// Uses the all-intra fixture on purpose. Every other clip holds fewer
-    /// keyframes (11-25) than the grid decoder has frame threads, so none of their
-    /// thumbnails arrive until the file has been demuxed to the end — cancelling
-    /// on the first one would come too late to stop any reading at all, and the
-    /// pass would look uncancellable when it is not.
+    /// Uses the all-intra fixture on purpose: it decodes on the CPU, where the
+    /// grid still keeps all cores, so it is the fixture with far more keyframes
+    /// (120) than the decoder has frame threads and thumbnails are certain to
+    /// arrive mid-read on any machine. The 4K fixture only streams where a GPU
+    /// caps the threads (ADR-0019), which is what
+    /// [`the_4k_grid_streams_thumbnails_before_it_finishes`] covers.
     #[test]
     fn cancel_stops_extraction_early() {
         init().unwrap();
